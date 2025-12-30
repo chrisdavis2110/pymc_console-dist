@@ -907,6 +907,7 @@ do_install() {
     patch_log_level_api "$INSTALL_DIR"           # PATCH 3: Log level toggle API
     patch_mesh_cli "$INSTALL_DIR"                # PATCH 4: MeshCore CLI parity
     patch_private_key_api "$INSTALL_DIR"         # PATCH 6: Private key get/set API
+    patch_dio2_rf_switch "$INSTALL_DIR"          # PATCH 7: DIO2 RF switch support
     
     # =========================================================================
     # Step 5: Install dashboard and console extras
@@ -1281,6 +1282,7 @@ Continue?"; then
     patch_mesh_cli "$INSTALL_DIR"                # PATCH 4: MeshCore CLI parity
     patch_stats_api "$INSTALL_DIR"               # PATCH 5: Extend stats API with MeshCore config
     patch_private_key_api "$INSTALL_DIR"         # PATCH 6: Private key get/set API
+    patch_dio2_rf_switch "$INSTALL_DIR"          # PATCH 7: DIO2 RF switch support
     
     # Ensure --log-level DEBUG is in service file (RX timing fix)
     if [ -f /etc/systemd/system/pymc-repeater.service ]; then
@@ -2304,7 +2306,10 @@ run_upstream_installer() {
 #    - Stores key in config['mesh']['identity_key']
 #    - PR Status: Pending
 #
-#    - PR Status: Pending
+# 7. patch_dio2_rf_switch (pymc_core + config.py)
+#    - Adds use_dio2_rf parameter for SX1262 radios (E22 modules)
+#    - Patches pymc_core sx1262_wrapper.py and repeater config.py
+#    - PR Status: pyMC_core #26, pyMC_Repeater #41
 #
 # NOTE: patch_static_file_serving was removed in v0.4.0 (SPA migration).
 # Upstream's default() method already returns index.html for all unknown routes,
@@ -2633,6 +2638,97 @@ patch_private_key_api() {
         print_success "Applied private key API patch"
     else
         print_warning "Private key API patch may not have applied correctly"
+    fi
+}
+
+# ------------------------------------------------------------------------------
+# PATCH 7: DIO2 RF Switch Support (pymc_core + config.py)
+# ------------------------------------------------------------------------------
+# Files: pymc_core/radios/sx1262_wrapper.py, repeater/config.py
+# Purpose: Enable DIO2 RF switch control for SX1262 radios (e.g., E22 modules)
+# Changes:
+#   - pymc_core: Add use_dio2_rf parameter to SX1262Radio.__init__
+#   - pymc_core: Call setDio2RfSwitch() with the parameter in begin()
+#   - config.py: Pass use_dio2_rf from sx1262 config section to radio init
+# Usage: Add use_dio2_rf: true under sx1262: section in config.yaml
+# PR Status:
+#   - pyMC_core PR #26: https://github.com/rightup/pyMC_core/pull/26
+#   - pyMC_Repeater PR #41: https://github.com/rightup/pyMC_Repeater/pull/41
+# ------------------------------------------------------------------------------
+patch_dio2_rf_switch() {
+    local target_dir="${1:-$CLONE_DIR}"
+    
+    # Find pymc_core location via Python
+    local pymc_core_path
+    pymc_core_path=$(python3 -c "import pymc_core; import os; print(os.path.dirname(pymc_core.__file__))" 2>/dev/null)
+    
+    if [ -z "$pymc_core_path" ] || [ ! -d "$pymc_core_path" ]; then
+        print_warning "pymc_core not found in Python path, skipping DIO2 patch"
+        return 0
+    fi
+    
+    local sx1262_file="$pymc_core_path/radios/sx1262_wrapper.py"
+    local config_file="$target_dir/repeater/config.py"
+    
+    # -------------------------------------------------------------------------
+    # Part 1: Patch pymc_core sx1262_wrapper.py
+    # -------------------------------------------------------------------------
+    if [ ! -f "$sx1262_file" ]; then
+        print_warning "sx1262_wrapper.py not found at $sx1262_file"
+    else
+        # Check if already patched
+        if grep -q 'use_dio2_rf' "$sx1262_file" 2>/dev/null; then
+            print_info "pymc_core DIO2 patch already applied"
+        else
+            print_info "Patching pymc_core sx1262_wrapper.py..."
+            
+            # Add use_dio2_rf parameter to __init__
+            # Find: txen_pin: int = -1,
+            # Add after: use_dio2_rf: bool = False,
+            sed -i 's/txen_pin: int = -1,$/txen_pin: int = -1,\n        use_dio2_rf: bool = False,/' "$sx1262_file"
+            
+            # Add docstring line after txen_pin docstring
+            sed -i 's/txen_pin: GPIO pin for TX enable signal (or -1 to disable)$/txen_pin: GPIO pin for TX enable signal (or -1 to disable)\n            use_dio2_rf: Use DIO2 as RF switch control (for E22 and similar modules)/' "$sx1262_file"
+            
+            # Store the parameter (add after self.txen_pin = txen_pin)
+            sed -i 's/self.txen_pin = txen_pin$/self.txen_pin = txen_pin\n        self.use_dio2_rf = use_dio2_rf/' "$sx1262_file"
+            
+            # Change setDio2RfSwitch(True) to setDio2RfSwitch(self.use_dio2_rf)
+            # and add logging
+            sed -i 's/self.lora.setDio2RfSwitch(True)/if self.use_dio2_rf:\n            logger.info("Enabling DIO2 RF switch control")\n        self.lora.setDio2RfSwitch(self.use_dio2_rf)/' "$sx1262_file"
+            
+            # Verify patch applied
+            if grep -q 'use_dio2_rf' "$sx1262_file" 2>/dev/null; then
+                print_success "Patched pymc_core sx1262_wrapper.py"
+            else
+                print_warning "pymc_core DIO2 patch may not have applied correctly"
+            fi
+        fi
+    fi
+    
+    # -------------------------------------------------------------------------
+    # Part 2: Patch repeater config.py to pass use_dio2_rf to radio
+    # -------------------------------------------------------------------------
+    if [ ! -f "$config_file" ]; then
+        print_warning "config.py not found at $config_file"
+    else
+        # Check if already patched
+        if grep -q 'use_dio2_rf' "$config_file" 2>/dev/null; then
+            print_info "config.py DIO2 patch already applied"
+        else
+            print_info "Patching repeater config.py..."
+            
+            # Find the line with "txen_pin" in the radio kwargs and add use_dio2_rf after it
+            # Pattern: "txen_pin": spi_config.get("txen_pin", -1),
+            sed -i 's/"txen_pin": spi_config.get("txen_pin", -1),$/"txen_pin": spi_config.get("txen_pin", -1),\n                    "use_dio2_rf": spi_config.get("use_dio2_rf", False),/' "$config_file"
+            
+            # Verify patch applied
+            if grep -q 'use_dio2_rf' "$config_file" 2>/dev/null; then
+                print_success "Patched config.py with use_dio2_rf"
+            else
+                print_warning "config.py DIO2 patch may not have applied correctly"
+            fi
+        fi
     fi
 }
 
