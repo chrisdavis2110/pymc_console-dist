@@ -122,6 +122,12 @@ cd pymc_console
 sudo bash manage.sh install
 ```
 
+> **⚠️ Important: Branch Selection**
+>
+> During installation, you'll be asked to select a pyMC_Repeater branch. **Select `feat/dmg`** (the default/recommended option). This branch contains the login/authentication functionality required for the dashboard to work properly.
+>
+> If you select `dev` or `main`, you may encounter "error 200" or login issues.
+
 The installer will:
 1. Install all system dependencies (Python, pip, etc.)
 2. Clone and install [pyMC_Repeater](https://github.com/rightup/pyMC_Repeater) as a sibling directory
@@ -233,6 +239,20 @@ sudo journalctl -u pymc-repeater -f
 
 ## Troubleshooting
 
+### "Error 200" or Login Issues
+
+This typically means you installed with the wrong pyMC_Repeater branch. The login functionality is only available in the `feat/dmg` branch.
+
+**To fix:**
+```bash
+cd pymc_console
+sudo bash manage.sh upgrade
+```
+
+Select **Full pyMC Stack** upgrade and choose the `feat/dmg` branch.
+
+> **Note:** When entering the branch name, use `feat/dmg` (not just `dmg`).
+
 ### Service won't start
 
 ```bash
@@ -253,6 +273,10 @@ cat /etc/pymc_repeater/config.yaml
 
 1. Verify service is running: `sudo systemctl status pymc-repeater`
 2. Check if port 8000 is accessible: `curl http://localhost:8000/api/stats`
+
+### "Radio presets file not found" warning
+
+This warning during installation is non-fatal. The installer will continue and you can configure radio settings manually. The presets are fetched from an API; if the API is unavailable, common presets are offered as fallback options.
 
 ## Uninstalling
 
