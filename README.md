@@ -69,12 +69,14 @@ The MeshCore Python ecosystem has three components:
 
 ### Contacts & Topology
 - **Interactive map** — MapLibre GL with dark theme, neighbor positions, and smooth animations
-- **Mesh topology graph** — Network connections inferred from packet paths
-- **Deep Analysis** — One-click full topology rebuild from 20K+ packets
-- **Intelligent disambiguation** — Four-factor scoring resolves prefix collisions
-- **Edge confidence** — Line thickness scales with observation count
+- **3D terrain mode** — Toggle real-world topographic terrain with hillshading; all markers and edges drape onto the landscape
+- **3D arc edges** — Topology edges and neighbor lines render as elevated arcs via deck.gl PathLayer (GPU-accelerated)
+- **Viterbi HMM path decoding** — Hidden Markov Model resolves prefix collisions using physics-based transition costs and observation evidence
+- **Ghost node discovery** — Unknown repeaters detected when no known candidate is geographically plausible; locations estimated from anchor midpoints
+- **Deep Analysis** — One-click full topology rebuild from 20K+ packets with Viterbi decoding
+- **Edge confidence** — Line thickness and opacity scale with observation count and certainty
 - **Animated edges** — Trace-in effect on toggle, smooth fade-out
-- **Filter toggles** — Solo view for hub nodes or direct neighbors only
+- **Filter toggles** — Solo view for hub nodes, direct neighbors, or traffic-based filtering
 - **Loop detection** — Identifies redundant paths (double-line rendering)
 - **High-contrast markers** — Light fill with dark outline ensures visibility against any overlay
 - **Path health panel** — Health scores, weakest links, and latency estimates for observed routes
@@ -211,6 +213,24 @@ radio:
   coding_rate: 6            # 4/5, 4/6, 4/7, or 4/8
 ```
 
+### Advanced: DIO2 and DIO3 Configuration
+
+Some LoRa modules require specific DIO pin configurations. These are **independent settings** that serve different purposes:
+
+- **DIO3 (TCXO)** — Temperature Compensated Crystal Oscillator control. Set `use_dio3_tcxo: true` if your module has a TCXO that needs DIO3 for voltage supply.
+- **DIO2 (RF Switch)** — Antenna RF switch control for TX/RX path switching. Set `use_dio2_rf: true` if your module requires DIO2 to control an external RF switch.
+
+> **Note:** These settings are available on the pyMC_Repeater `dev` branch (which uses pyMC_core `dev`). The `main` branch hardcodes `setDio2RfSwitch(False)`.
+
+Example for modules requiring both:
+```yaml
+radio:
+  use_dio3_tcxo: true    # Enable TCXO via DIO3
+  use_dio2_rf: true      # Enable RF switch via DIO2 (dev branch only)
+```
+
+**Important:** Setting `use_dio3_tcxo: true` does NOT automatically enable DIO2. They are independent configurations for different hardware features.
+
 ### Service Management
 
 ```bash
@@ -304,7 +324,30 @@ Packet path: ["FA", "79", "24", "19"]
            Origin → Hop1 → Hop2 → Local
 ```
 
-**The Challenge**: Multiple nodes may share the same 2-char prefix (1 in 256 collision chance). The system uses four-factor scoring inspired by [meshcore-bot](https://github.com/agessaman/meshcore-bot) to resolve ambiguity:
+**The Challenge**: Multiple nodes may share the same 2-char prefix (1 in 256 collision chance). The system uses a **Viterbi HMM decoder** to find the most likely sequence of actual nodes:
+
+#### Viterbi Path Decoding
+
+Inspired by [d40cht/meshcore-connectivity-analysis](https://github.com/d40cht/meshcore-connectivity-analysis), the decoder treats path disambiguation as a Hidden Markov Model problem:
+
+- **States** — All candidate nodes matching each prefix, plus a "ghost" state for unknown nodes
+- **Priors** — Based on recency (recently-seen nodes are more likely) and disambiguation confidence
+- **Transitions** — Physics-based costs using geographic distance and LoRa range constraints
+
+**Key principle: Observation beats theory.** When edge observations have ≥80% confidence, real-world evidence overrides physics-based costs.
+
+#### Ghost Node Discovery
+
+When no known candidate is geographically plausible for a prefix, the decoder selects a "ghost" state. These are aggregated to discover unknown repeaters:
+
+- **Clustering** — Ghost observations grouped by prefix
+- **Location estimation** — Weighted centroid of anchor node midpoints
+- **Confidence scoring** — Based on observation count, common neighbors, and location variance
+- **UI panel** — Shows likely-real ghost nodes with estimated coordinates and adjacent known nodes
+
+#### Four-Factor Scoring (Pre-Viterbi)
+
+Before Viterbi decoding, candidates are scored using four-factor analysis inspired by [meshcore-bot](https://github.com/agessaman/meshcore-bot):
 
 1. **Position (15%)** — Where in paths does this prefix typically appear?
 2. **Co-occurrence (15%)** — Which prefixes appear adjacent to this one?
@@ -317,7 +360,6 @@ Packet path: ["FA", "79", "24", "19"]
 - **Age filtering** — Nodes not seen in 14 days are excluded from consideration
 - **Dual-hop anchoring** — Candidates scored by distance to both previous and next hops (a relay must be within RF range of both neighbors)
 - **Score-weighted redistribution** — Appearance counts redistributed proportionally by combined score
-- **Source-geographic correlation** — Position-1 prefixes scored by distance from packet origin
 
 The system loads up to 20,000 packets (~7 days of traffic) to build comprehensive topology evidence.
 
@@ -338,6 +380,16 @@ Topology edges are rendered with visual cues indicating confidence:
 - **Fade animation** — Edges smoothly fade out when topology is disabled
 - **Loop edges** — Redundant paths rendered as parallel double-lines in accent color
 
+### 3D Terrain & Visualization
+
+The Contacts map supports full 3D terrain rendering:
+
+- **Terrain tiles** — AWS Terrarium elevation data (free, no API key)
+- **Hillshading** — Visual depth tuned for dark map themes
+- **3D arcs** — Topology edges and neighbor lines rendered as elevated arcs via deck.gl
+- **GPU acceleration** — deck.gl PathLayer and IconLayer for smooth pan/zoom/tilt
+- **Automatic draping** — All markers and edges align to terrain elevation
+
 ### Path Visualization
 
 Clicking a packet shows its route on a map with confidence indicators:
@@ -346,7 +398,7 @@ Clicking a packet shows its route on a map with confidence indicators:
 - **Yellow** — 50-99% confidence (high certainty)
 - **Orange** — 25-49% confidence (medium certainty)
 - **Red** — 1-24% confidence (low certainty)
-- **Gray** — Unknown prefix (not in neighbor list)
+- **Gray/Ghost** — Unknown prefix resolved to ghost node
 
 ## License
 
@@ -359,5 +411,6 @@ Built on the excellent work of:
 - **[RightUp](https://github.com/rightup)** — Creator of pyMC_Repeater, pymc_core, and the MeshCore ecosystem
 - **[pyMC_Repeater](https://github.com/rightup/pyMC_Repeater)** — Core repeater daemon for LoRa communication and mesh routing
 - **[pymc_core](https://github.com/rightup/pyMC_core)** — Underlying mesh protocol library
+- **[d40cht/meshcore-connectivity-analysis](https://github.com/d40cht/meshcore-connectivity-analysis)** — Viterbi HMM approach for path disambiguation and ghost node discovery
 - **[meshcore-bot](https://github.com/agessaman/meshcore-bot)** — Inspiration for recency scoring and dual-hop anchor disambiguation
 - **[MeshCore](https://meshcore.co.uk/)** — The MeshCore project and community
