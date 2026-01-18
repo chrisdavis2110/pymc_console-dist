@@ -1,6 +1,6 @@
 {
   "name": "pymc_console",
-  "version": "0.9.144",
+  "version": "0.9.145",
   "description": "Vite + React Dashboard for pyMC_Repeater",
   "private": true,
   "type": "module",
@@ -25,7 +25,9 @@
     "@fontsource/inter": "^5.2.8",
     "@fontsource/jacquard-12": "^5.2.8",
     "@fontsource/jetbrains-mono": "^5.2.8",
+    "@fontsource/noto-sans": "^5.2.10",
     "@fontsource/rubik-mono-one": "^5.2.8",
+    "@fontsource/source-code-pro": "^5.2.7",
     "@types/leaflet": "^1.9.21",
     "@types/three": "^0.182.0",
     "axios": "^1.13.2",
