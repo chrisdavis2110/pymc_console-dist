@@ -2455,12 +2455,30 @@ UI_RELEASE_URL="https://github.com/${UI_REPO}/releases"
 # Download and install dashboard from GitHub Releases
 # Installs to separate directory (UI_DIR) instead of overwriting upstream Vue.js
 # Configures web.web_path in config.yaml to point to our dashboard
+# UPGRADE BEHAVIOR: Preserves user's UI preference (stock vs pymc_console)
 install_static_frontend() {
     local version="${1:-latest}"
     local target_dir="$UI_DIR"
     local config_file="$CONFIG_DIR/config.yaml"
     local temp_file="/tmp/pymc-ui-$$.tar.gz"
     local download_url
+    
+    # Check current web_path BEFORE making any changes
+    # This preserves user preference for stock vs pymc_console UI
+    local current_web_path=""
+    local is_fresh_install=true
+    if [ -f "$config_file" ] && command -v yq &> /dev/null; then
+        current_web_path=$(yq eval '.web.web_path // ""' "$config_file" 2>/dev/null || echo "")
+        # Trim whitespace and handle "null" string
+        current_web_path=$(echo "$current_web_path" | tr -d '[:space:]')
+        if [ "$current_web_path" = "null" ]; then
+            current_web_path=""
+        fi
+        # If web_path exists (even if empty), this is an upgrade, not fresh install
+        if yq eval '.web | has("web_path")' "$config_file" 2>/dev/null | grep -q 'true'; then
+            is_fresh_install=false
+        fi
+    fi
     
     # Construct download URL
     if [ "$version" = "latest" ]; then
@@ -2521,18 +2539,33 @@ install_static_frontend() {
     # Set permissions
     chown -R "$SERVICE_USER:$SERVICE_USER" "$CONSOLE_DIR" 2>/dev/null || true
     
-    # Configure CherryPy to serve our dashboard instead of built-in Vue.js
-    # This sets web.web_path in config.yaml
+    # Configure CherryPy web_path based on user preference
+    # - Fresh install: set web_path to our dashboard
+    # - Upgrade with pymc_console selected: keep pointing to our dashboard
+    # - Upgrade with stock UI selected (empty web_path): preserve user's choice
     if [ -f "$config_file" ] && command -v yq &> /dev/null; then
         # Ensure web section exists
         if ! yq eval '.web' "$config_file" 2>/dev/null | grep -q -v "null"; then
             yq -i '.web = {}' "$config_file" 2>/dev/null || true
         fi
-        # Set web_path to our dashboard location
-        yq -i ".web.web_path = \"$target_dir\"" "$config_file" 2>/dev/null || {
-            print_warning "Could not set web_path in config - manual configuration may be required"
-        }
-        print_success "Configured web_path: $target_dir"
+        
+        if [ "$is_fresh_install" = true ]; then
+            # Fresh install: default to pymc_console dashboard
+            yq -i ".web.web_path = \"$target_dir\"" "$config_file" 2>/dev/null || {
+                print_warning "Could not set web_path in config - manual configuration may be required"
+            }
+            print_success "Configured web_path: $target_dir"
+        elif [ -n "$current_web_path" ]; then
+            # Upgrade: user was using pymc_console, keep it that way
+            # (Update path in case it moved, though it shouldn't)
+            yq -i ".web.web_path = \"$target_dir\"" "$config_file" 2>/dev/null || true
+            print_success "Preserved UI preference: pymc_console dashboard"
+        else
+            # Upgrade: user was using stock UI (web_path is empty/null)
+            # Preserve their preference - don't change web_path
+            print_success "Preserved UI preference: stock (RightUp) frontend"
+            print_info "Switch to pymc_console via Settings → Web Frontend"
+        fi
     else
         print_warning "Could not configure web_path - yq not available or config missing"
         print_info "Manually set web.web_path in $config_file to: $target_dir"
