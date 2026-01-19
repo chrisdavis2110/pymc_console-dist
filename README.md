@@ -7,6 +7,8 @@ A modern web dashboard for monitoring and managing your [MeshCore](https://meshc
 
 Built on [pyMC_Repeater](https://github.com/rightup/pyMC_Repeater) by [RightUp](https://github.com/rightup), pyMC Console provides real-time visibility into your mesh network with an intuitive, feature-rich interface.
 
+![Topology Analysis Overview](docs/images/analyzer-overview.gif)
+
 ## How It All Fits Together
 
 The MeshCore Python ecosystem has three components:
@@ -46,7 +48,68 @@ The MeshCore Python ecosystem has three components:
 - Console provides the web UI; Repeater provides the backend API and radio control
 - You can upgrade Console independently without touching Repeater/Core
 
-## Features
+## Feature Highlights
+
+### 🗺️ Mesh Topology Analysis
+
+The topology analyzer reconstructs your network's structure from packet paths using a **Viterbi HMM decoder** — resolving prefix collisions with physics-based constraints and observation evidence.
+
+![Topology Analysis](docs/images/analyzer-overview.gif)
+
+- **Deep Analysis** — One-click full topology rebuild from 75K packets
+- **Viterbi HMM decoding** — Hidden Markov Model resolves prefix collisions using geographic distance and LoRa range constraints
+- **Ghost node discovery** — Detects unknown repeaters when no known candidate is geographically plausible
+- **3D terrain mode** — Real-world topographic terrain with hillshading; markers and edges drape onto the landscape
+- **3D arc edges** — Topology edges rendered as elevated arcs via deck.gl (GPU-accelerated)
+- **Edge confidence visualization** — Line thickness scales with observation count; color indicates certainty
+- **Wardriving overlay** — H3 hexagonal tiles from coverage servers with SNR-based coloring
+
+### 📡 Link Quality Radar
+
+The polar chart visualizes all contacts at their actual compass bearing and distance from your node.
+
+![Link Quality Polar](docs/images/linkquality-demo.gif)
+
+- **Zero-hop neighbors** — Colored by SNR quality (green → yellow → orange → red)
+- **Non-neighbors** — Rendered at 33% opacity to distinguish direct RF contacts
+- **Hover interaction** — Full opacity with detailed signal metrics tooltip
+
+### 📊 Statistics Dashboard
+
+Comprehensive RF metrics and network composition analysis.
+
+![Statistics View](docs/images/statsview-expose.gif)
+
+- **Airtime utilization** — RX/TX spectrum with peak and mean metrics
+- **Packet types treemap** — Distribution of ADVERT, TXT_MSG, ACK, RESPONSE, etc.
+- **Network composition** — Breakdown of repeaters, companions, and room servers
+- **RF noise floor** — Heatmap showing interference patterns over time
+- **Prefix disambiguation health** — Confidence metrics for topology inference
+
+### 🛤️ Packet Path Tracing
+
+Click any packet to visualize its route through the mesh with hop-by-hop confidence indicators.
+
+![Path Trace Demo](docs/images/trace-demo.gif)
+
+- **Confidence coloring** — Green (100%), Yellow (50-99%), Orange (25-49%), Red (<25%), Gray (ghost node)
+- **Interactive map** — Shows the resolved path with all intermediate hops
+- **Signal details** — RSSI, SNR, and timing for each packet
+
+### 🎨 Themes & Terminal
+
+Six color schemes and a built-in terminal for direct repeater interaction.
+
+![Themes and Terminal](docs/images/terminal-and-themes.gif)
+
+- **Color schemes** — Seoul256, Gruvbox, Deus, Gotham, Sonokai, Kanagawa
+- **Background images** — Multiple ambient backgrounds with adjustable brightness
+- **Terminal** — Direct CLI access to the repeater for advanced operations
+- **Live logs** — Stream from repeater daemon with DEBUG/INFO toggle
+
+---
+
+## All Features
 
 ### Dashboard
 - **Live packet metrics** — Received, forwarded, dropped packets with sparkline charts
@@ -55,35 +118,13 @@ The MeshCore Python ecosystem has three components:
 - **Time range selector** — View stats from 20 minutes to 7 days
 - **Recent packets** — Live feed of incoming traffic with centralized polling (every 3s)
 
-![Dashboard](docs/images/dashboard.png)
-
-### Statistics
-- **Airtime utilization** — RX/TX utilization spectrum with peak and mean metrics
-- **Link quality polar** — Neighbor signal strength plotted by compass bearing
-- **Network composition** — Breakdown of repeaters, companions, and room servers
-- **Packet types treemap** — Distribution of ADVERT, TXT_MSG, ACK, RESPONSE, etc.
-- **RF noise floor** — Noise floor heatmap showing interference patterns over time
-- **Prefix disambiguation** — Health metrics for the topology inference system
-
-![Statistics](docs/images/statistics.png)
-
 ### Contacts & Topology
-- **Interactive map** — MapLibre GL with dark theme, neighbor positions, and smooth animations
-- **3D terrain mode** — Toggle real-world topographic terrain with hillshading; all markers and edges drape onto the landscape
-- **3D arc edges** — Topology edges and neighbor lines render as elevated arcs via deck.gl PathLayer (GPU-accelerated)
-- **Viterbi HMM path decoding** — Hidden Markov Model resolves prefix collisions using physics-based transition costs and observation evidence
-- **Ghost node discovery** — Unknown repeaters detected when no known candidate is geographically plausible; locations estimated from anchor midpoints
-- **Deep Analysis** — One-click full topology rebuild from 75K packets with Viterbi decoding
-- **Edge confidence** — Line thickness and opacity scale with observation count and certainty
-- **Animated edges** — Trace-in effect on toggle, smooth fade-out
+- **Interactive map** — MapLibre GL with dark theme, smooth animations
 - **Filter toggles** — Solo view for hub nodes, direct neighbors, or traffic-based filtering
 - **Loop detection** — Identifies redundant paths (double-line rendering)
 - **High-contrast markers** — Light fill with dark outline ensures visibility against any overlay
-- **Path health panel** — Health scores, weakest links, and latency estimates for observed routes
+- **Path health panel** — Health scores, weakest links, and latency estimates
 - **Mobile node detection** — Identifies volatile nodes that appear/disappear frequently
-- **Wardriving coverage overlay** — H3 hexagonal tiles from external coverage servers (e.g., coverage.wcmesh.com) with SNR-based coloring
-
-![Topology Map](docs/images/topology.png)
 
 ### Packets
 - **Searchable history** — Filter by type, route, time range
@@ -94,18 +135,11 @@ The MeshCore Python ecosystem has three components:
 - **Mode toggle** — Forward (repeating) or Monitor (RX only)
 - **Duty cycle** — Enable/disable enforcement
 - **Radio config** — Live frequency, power, SF, bandwidth changes
-- **Theme selection** — Six color schemes (Seoul256, Gruvbox, Deus, Gotham, Sonokai, Kanagawa)
-- **Background images** — Multiple ambient backgrounds with adjustable brightness
-
-![Settings](docs/images/settings.png)
 
 ### System & Logs
 - **System resources** — 20-minute rolling CPU and memory utilization chart
 - **Disk usage** — Storage utilization with progress bar
 - **Temperature** — Multi-sensor temperature gauges with threshold coloring
-- **Live logs** — Stream from repeater daemon with DEBUG/INFO toggle
-
-![System](docs/images/system.png)
 
 ## Quick Start
 
@@ -362,8 +396,6 @@ Before Viterbi decoding, candidates are scored using four-factor analysis inspir
 - **Score-weighted redistribution** — Appearance counts redistributed proportionally by combined score
 
 The system maintains up to 75,000 packets in session memory (~2.5 days at 30k/day) for comprehensive topology evidence.
-
-![Prefix Disambiguation](docs/images/disambiguation.png)
 
 ### Edge Rendering
 
