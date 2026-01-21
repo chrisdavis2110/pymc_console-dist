@@ -451,17 +451,20 @@ do_uninstall() {
     local has_repeater=false
     local has_console=false
     local has_clone=false
-    local has_self=false
+    local has_self=true  # Script is always running from somewhere
     
     is_installed && has_repeater=true
     [[ -d "$CONSOLE_DIR" ]] && has_console=true
     [[ -d "$CLONE_DIR" ]] && has_clone=true
-    [[ -d "$SCRIPT_DIR/.git" ]] && has_self=true
     
-    if [[ "$has_repeater" == false && "$has_console" == false && "$has_clone" == false ]]; then
-        show_error "Nothing to uninstall."
-        return 1
-    fi
+    # Debug: show what we found
+    print_banner
+    echo -e "  ${DIM}Detected components:${NC}"
+    echo -e "    Repeater:  $([[ "$has_repeater" == true ]] && echo "${GREEN}found${NC}" || echo "${DIM}not found${NC}")"
+    echo -e "    Console:   $([[ "$has_console" == true ]] && echo "${GREEN}found${NC} ($CONSOLE_DIR)" || echo "${DIM}not found${NC}")"
+    echo -e "    Clone:     $([[ "$has_clone" == true ]] && echo "${GREEN}found${NC} ($CLONE_DIR)" || echo "${DIM}not found${NC}")"
+    echo -e "    This repo: ${GREEN}$SCRIPT_DIR${NC}"
+    echo ""
     
     if [[ "$EUID" -ne 0 ]]; then
         show_error "Uninstall requires root.\n\nRun: sudo $0 uninstall"
@@ -471,20 +474,22 @@ do_uninstall() {
     # Build description of what will be removed
     local will_remove=""
     [[ "$has_repeater" == true ]] && will_remove+="• pyMC_Repeater\n"
-    [[ "$has_console" == true ]] && will_remove+="• pyMC Console dashboard\n"
-    [[ "$has_clone" == true ]] && will_remove+="• pyMC_Repeater clone\n"
-    will_remove+="• All configuration"
+    [[ "$has_console" == true ]] && will_remove+="• Console dashboard ($CONSOLE_DIR)\n"
+    [[ "$has_clone" == true ]] && will_remove+="• pyMC_Repeater clone ($CLONE_DIR)\n"
+    will_remove+="• pymc_console repo ($SCRIPT_DIR)"
     
-    if ! ask_yes_no "Confirm Uninstall" "\nThis will remove:\n${will_remove}\n\nThis cannot be undone!\n\nContinue?"; then
+    if ! ask_yes_no "Confirm Uninstall" "\nThis will remove:\n${will_remove}\n\nContinue?"; then
         return 0
     fi
     
     print_banner
     
+    # Calculate steps: repeater(optional) + console + clone(optional) + self
     local step=1
-    local total=2
+    local total=1  # self is always counted
+    [[ "$has_repeater" == true ]] && ((total++))
+    [[ "$has_console" == true ]] && ((total++))
     [[ "$has_clone" == true ]] && ((total++))
-    [[ "$has_self" == true ]] && ((total++))
     
     # Step: Run upstream uninstall (if Repeater installed)
     if [[ "$has_repeater" == true ]]; then
@@ -507,11 +512,13 @@ do_uninstall() {
         ((step++))
     fi
     
-    # Step: Remove dashboard overlay
-    print_step $step $total "Removing dashboard"
-    rm -rf "$CONSOLE_DIR"
-    print_success "Dashboard removed ($CONSOLE_DIR)"
-    ((step++))
+    # Step: Remove dashboard overlay (if exists)
+    if [[ "$has_console" == true ]]; then
+        print_step $step $total "Removing dashboard"
+        rm -rf "$CONSOLE_DIR"
+        print_success "Dashboard removed ($CONSOLE_DIR)"
+        ((step++))
+    fi
     
     # Step: Remove clone
     if [[ "$has_clone" == true ]]; then
@@ -521,19 +528,11 @@ do_uninstall() {
         ((step++))
     fi
     
-    # Step: Offer to remove pymc_console repo itself
-    if [[ "$has_self" == true ]]; then
-        print_step $step $total "pymc_console repo"
-        if ask_yes_no "Remove pymc_console?" "\nRemove pymc_console repo at:\n$SCRIPT_DIR?\n\n(You're running this script from there)"; then
-            # Schedule self-deletion after script exits
-            echo ""
-            echo -e "${YELLOW}Removing $SCRIPT_DIR after exit...${NC}"
-            trap "rm -rf '$SCRIPT_DIR'" EXIT
-            print_success "Scheduled for removal"
-        else
-            print_info "Keeping $SCRIPT_DIR"
-        fi
-    fi
+    # Step: Remove pymc_console repo itself (scheduled for after script exits)
+    print_step $step $total "Removing pymc_console repo"
+    echo -e "    ${YELLOW}Will remove $SCRIPT_DIR after script exits${NC}"
+    trap "rm -rf '$SCRIPT_DIR'" EXIT
+    print_success "Scheduled for removal"
     
     echo ""
     echo -e "${GREEN}${BOLD}Uninstall Complete${NC}"
