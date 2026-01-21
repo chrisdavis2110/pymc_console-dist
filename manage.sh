@@ -707,10 +707,38 @@ get_repeater_branch() {
     fi
 }
 
-# Get pyMC Repeater version from installed pyproject.toml
+# Get pyMC Repeater version from pip or pyproject.toml
+# pyMC_Repeater uses setuptools_scm (dynamic versioning from git tags)
+# so we need to check pip for the actual installed version
 get_version() {
+    # First try pip (most accurate for installed package)
+    local version
+    version=$(pip3 show pymc-repeater 2>/dev/null | grep "^Version:" | awk '{print $2}')
+    if [ -n "$version" ]; then
+        echo "$version"
+        return
+    fi
+    
+    # Try alternate package name
+    version=$(pip3 show pymc_repeater 2>/dev/null | grep "^Version:" | awk '{print $2}')
+    if [ -n "$version" ]; then
+        echo "$version"
+        return
+    fi
+    
+    # Fallback: try static version in pyproject.toml (older format)
     if [ -f "$REPEATER_DIR/pyproject.toml" ]; then
-        grep "^version" "$REPEATER_DIR/pyproject.toml" | cut -d'"' -f2 2>/dev/null || echo "unknown"
+        # Match 'version = "X.Y.Z"' but not 'version_scheme' or 'dynamic'
+        version=$(grep -E '^version\s*=\s*"' "$REPEATER_DIR/pyproject.toml" 2>/dev/null | cut -d'"' -f2 | head -1)
+        if [ -n "$version" ]; then
+            echo "$version"
+            return
+        fi
+    fi
+    
+    # Check if directory exists but version unknown
+    if [ -d "$REPEATER_DIR" ]; then
+        echo "unknown"
     else
         echo "not installed"
     fi
@@ -764,13 +792,24 @@ get_status_display() {
     if ! is_installed; then
         echo "Not Installed"
     else
-        local version=$(get_version)
         local status="Stopped"
-        
         backend_running && status="Running"
-        
-        echo "v$version | Service: $status"
+        echo "Service: $status"
     fi
+}
+
+# Get full version summary for display
+# Returns multi-line string with all component versions
+get_version_summary() {
+    local core_ver=$(get_core_version)
+    local repeater_ver=$(get_repeater_version)
+    local console_ver=$(get_console_version)
+    local core_branch=$(get_core_branch_from_toml "$CLONE_DIR")
+    local repeater_branch=$(get_repeater_branch)
+    
+    echo "pyMC Core:     v${core_ver} @${core_branch}"
+    echo "pyMC Repeater: v${repeater_ver} @${repeater_branch}"
+    echo "pyMC Console:  ${console_ver}"
 }
 
 # ============================================================================
@@ -2624,8 +2663,13 @@ merge_config() {
 
 show_main_menu() {
     local status=$(get_status_display)
+    local core_ver=$(get_core_version)
+    local repeater_ver=$(get_repeater_version)
+    local console_ver=$(get_console_version)
+    local core_branch=$(get_core_branch_from_toml "$CLONE_DIR")
+    local repeater_branch=$(get_repeater_branch)
     
-    CHOICE=$($DIALOG --backtitle "pyMC Console Management" --title "pyMC Console" --menu "\nStatus: $status\n\nChoose an action:" 20 70 10 \
+    CHOICE=$($DIALOG --backtitle "pyMC Console Management" --title "pyMC Console" --menu "\n$status\n\nInstalled Versions:\n  Core:     v${core_ver} @${core_branch}\n  Repeater: v${repeater_ver} @${repeater_branch}\n  Console:  ${console_ver}\n\nChoose an action:" 24 70 10 \
         "install" "Install pyMC Console (fresh install)" \
         "upgrade" "Upgrade existing installation" \
         "settings" "Configure radio settings" \
