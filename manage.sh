@@ -399,47 +399,30 @@ do_upgrade() {
         branch=$(cd "$CLONE_DIR" && git rev-parse --abbrev-ref HEAD 2>/dev/null) || branch="$DEFAULT_BRANCH"
     fi
     
-    # Component selection checklist
-    local choices
-    choices=$($DIALOG --backtitle "pyMC Console" --title "Select Components" \
-        --checklist "\nSelect what to upgrade:\n\nYour configuration will be preserved." 14 55 2 \
-        "console"  "pyMC Console dashboard" ON \
-        "repeater" "pyMC_Repeater ($branch)" ON \
+    # Upgrade type selection
+    local upgrade_type
+    upgrade_type=$($DIALOG --backtitle "pyMC Console" --title "Upgrade" --menu \
+        "\nWhat would you like to upgrade?" 12 55 2 \
+        "console" "Console only" \
+        "full"    "Full Stack (Repeater + Console)" \
         3>&1 1>&2 2>&3) || return 0
     
-    local upgrade_console=false
-    local upgrade_repeater=false
-    [[ "$choices" == *"console"* ]] && upgrade_console=true
-    [[ "$choices" == *"repeater"* ]] && upgrade_repeater=true
-    
-    # Nothing selected
-    if [[ "$upgrade_console" == false && "$upgrade_repeater" == false ]]; then
-        show_info "Nothing Selected" "No components selected for upgrade."
-        return 0
-    fi
-    
     print_banner
+    echo -e "  ${DIM}Mode: $([[ "$upgrade_type" == "full" ]] && echo "Full Stack" || echo "Console Only")${NC}"
     
-    # Calculate steps
-    local step=1
-    local total=0
-    [[ "$upgrade_repeater" == true ]] && ((total+=2))  # clone + upgrade
-    [[ "$upgrade_console" == true ]] && ((total++))
-    
-    # Upgrade Repeater if selected
-    if [[ "$upgrade_repeater" == true ]]; then
-        print_step $step $total "Updating pyMC_Repeater source"
+    if [[ "$upgrade_type" == "full" ]]; then
+        # Full stack: 3 steps
+        print_step 1 3 "Updating pyMC_Repeater source"
         clone_upstream "$branch"
-        ((step++))
         
-        print_step $step $total "Upgrading pyMC_Repeater"
+        print_step 2 3 "Upgrading pyMC_Repeater"
         run_upstream "upgrade" || return 1
-        ((step++))
-    fi
-    
-    # Upgrade Console if selected
-    if [[ "$upgrade_console" == true ]]; then
-        print_step $step $total "Updating dashboard"
+        
+        print_step 3 3 "Updating dashboard"
+        install_dashboard
+    else
+        # Console only: 1 step
+        print_step 1 1 "Updating dashboard"
         install_dashboard
     fi
     
