@@ -1,2352 +1,673 @@
 #!/bin/bash
-# pyMC Console Management Script
-# Install, Upgrade, Configure, and Manage pymc_console stack
+# ═══════════════════════════════════════════════════════════════════════════════
+# pyMC Console - Dashboard Overlay Manager
+# ═══════════════════════════════════════════════════════════════════════════════
 #
-# INSTALLATION FLOW (mirrors upstream pyMC_Repeater):
-# 1. User clones pymc_console to their preferred location (e.g., ~/pymc_console)
-# 2. User runs: sudo ./manage.sh install
-# 3. This script clones pyMC_Repeater as a sibling directory (e.g., ~/pyMC_Repeater)
-# 4. Applies patches to the clone, then copies files to /opt/pymc_repeater
-# 5. Installs Python packages from the clone directory
-# 6. Overlays our React dashboard to the installation
+# ARCHITECTURE: Thin wrapper around pyMC_Repeater's native installer.
+# We don't duplicate upstream's functionality - we extend it with our dashboard.
 #
-# This matches upstream's flow where manage.sh runs from within a cloned repo
-# and copies files to /opt. This makes it easier to:
-# - Submit patches as PRs to upstream
-# - Stay compatible with upstream updates
-# - Allow users to switch between console and vanilla pyMC_Repeater
-
-# ============================================================================
-# Bootstrap Self-Healing (runs BEFORE anything else)
-# ============================================================================
-# Fixes chicken-and-egg: if git history diverged (e.g., after force-push),
-# the old manage.sh can't pull the new manage.sh. This check runs early
-# and resyncs if needed, then re-execs to run the updated script.
-
-_bootstrap_self_heal() {
-    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    
-    # Only heal if we're in a git repo and running as root (upgrade/install context)
-    [ ! -d "$script_dir/.git" ] && return 0
-    [ "$EUID" -ne 0 ] && return 0
-    
-    # Skip if BOOTSTRAP_DONE is set (prevents infinite loop)
-    [ -n "$BOOTSTRAP_DONE" ] && return 0
-    
-    cd "$script_dir" || return 0
-    git config --global --add safe.directory "$script_dir" 2>/dev/null || true
-    git fetch origin 2>/dev/null || return 0
-    
-    local local_hash=$(git rev-parse HEAD 2>/dev/null)
-    local remote_hash=$(git rev-parse origin/main 2>/dev/null || git rev-parse origin/master 2>/dev/null)
-    
-    # If already up-to-date, nothing to do
-    [ -z "$remote_hash" ] && return 0
-    [ "$local_hash" = "$remote_hash" ] && return 0
-    
-    # Check if fast-forward is possible
-    if git merge-base --is-ancestor HEAD "$remote_hash" 2>/dev/null; then
-        # Fast-forward works, let normal upgrade flow handle it
-        return 0
-    fi
-    
-    # History diverged! Fix it now.
-    echo -e "\033[1;33m⚠ Detected diverged git history - auto-healing...\033[0m"
-    if git reset --hard "origin/main" 2>/dev/null || git reset --hard "origin/master" 2>/dev/null; then
-        echo -e "\033[0;32m✓ Repository synced - restarting with updated script...\033[0m"
-        echo ""
-        export BOOTSTRAP_DONE=1
-        exec "$script_dir/manage.sh" "$@"
-    else
-        echo -e "\033[0;31m✗ Auto-heal failed. Manual fix: cd $script_dir && git fetch && git reset --hard origin/main\033[0m"
-    fi
-}
-
-# Run bootstrap check, passing through all args for re-exec
-_bootstrap_self_heal "$@"
+# WHAT WE DO:
+#   • Clone/update pyMC_Repeater (to access their manage.sh)
+#   • Call upstream's manage.sh for install/upgrade/uninstall
+#   • Overlay our React dashboard after upstream completes
+#   • Respect user's UI preference (don't force our dashboard on upgrades)
+#
+# WHAT UPSTREAM DOES:
+#   • User creation, directories, dependencies
+#   • pip install (pymc_repeater, pymc_core)
+#   • Service file, systemd management
+#   • Radio/GPIO configuration
+#   • Config file management
+#
+# DASHBOARD OVERLAY RULES:
+#   • Fresh install → Set web.web_path to our dashboard
+#   • Upgrade → Update files only, preserve user's web_path choice
+#
+# ═══════════════════════════════════════════════════════════════════════════════
 
 set -e
 
-# ============================================================================
-# Path Configuration
-# ============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Script location (where pymc_console was cloned)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
-# pyMC_Repeater clone location (sibling to pymc_console)
-# e.g., if SCRIPT_DIR is ~/dev/pymc_console, CLONE_DIR is ~/dev/pyMC_Repeater
 CLONE_DIR="$(dirname "$SCRIPT_DIR")/pyMC_Repeater"
 
-# Installation paths (where files are deployed - matches upstream)
-# INSTALL_DIR: Where pyMC_Repeater is installed (matches upstream standard)
-# CONSOLE_DIR: Where pymc_console stores its files (radio presets, dashboard, etc.)
-# UI_DIR: Where our React dashboard is installed (separate from upstream Vue.js)
 INSTALL_DIR="/opt/pymc_repeater"
 CONSOLE_DIR="/opt/pymc_console"
-UI_DIR="/opt/pymc_console/web/html"
+UI_DIR="$CONSOLE_DIR/web/html"
 CONFIG_DIR="/etc/pymc_repeater"
-LOG_DIR="/var/log/pymc_repeater"
-SERVICE_USER="repeater"
 
-REPEATER_DIR="$INSTALL_DIR"
-
-# Service name (backend serves both API and static frontend)
-BACKEND_SERVICE="pymc-repeater"
-
-# Default branch for installations
+SERVICE_NAME="pymc-repeater"
 DEFAULT_BRANCH="dev"
 
-# Colors for terminal output
+UI_REPO="dmduran12/pymc_console-dist"
+UI_RELEASE_URL="https://github.com/${UI_REPO}/releases"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Terminal Output
+# ─────────────────────────────────────────────────────────────────────────────
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
 CYAN='\033[0;36m'
-WHITE='\033[97m'  # Bright white for glow effect
 BOLD='\033[1m'
 DIM='\033[2m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Status indicators
-CHECK="${GREEN}✓${NC}"
-CROSS="${RED}✗${NC}"
-ARROW="${CYAN}➜${NC}"
-SPINNER_CHARS='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏'
+print_step()    { echo -e "\n${BOLD}${CYAN}[$1/$2]${NC} ${BOLD}$3${NC}"; }
+print_success() { echo -e "    ${GREEN}✓${NC} $1"; }
+print_error()   { echo -e "    ${RED}✗${NC} ${RED}$1${NC}"; }
+print_info()    { echo -e "    ${CYAN}➜${NC} $1"; }
+print_warning() { echo -e "    ${YELLOW}⚠${NC} $1"; }
 
-# ============================================================================
-# Progress Display Functions
-# ============================================================================
-
-# Print a step header
-print_step() {
-    local step_num="$1"
-    local total_steps="$2"
-    local description="$3"
-    echo ""
-    echo -e "${BOLD}${CYAN}[$step_num/$total_steps]${NC} ${BOLD}$description${NC}"
-}
-
-# Print success message
-print_success() {
-    echo -e "        ${CHECK} $1"
-}
-
-# Print error message
-print_error() {
-    echo -e "        ${CROSS} ${RED}$1${NC}"
-}
-
-# Print info message
-print_info() {
-    echo -e "        ${ARROW} $1"
-}
-
-# Print warning message
-print_warning() {
-    echo -e "        ${YELLOW}⚠${NC} $1"
-}
-
-# Run a command with spinner and capture output
-run_with_spinner() {
-    local description="$1"
-    shift
-    local cmd="$@"
-    local log_file=$(mktemp)
-    local pid
-    local i=0
-    
-    # Start command in background
-    eval "$cmd" > "$log_file" 2>&1 &
-    pid=$!
-    
-    # Show spinner while command runs
-    printf "        ${DIM}%s${NC} " "$description"
-    while kill -0 $pid 2>/dev/null; do
-        printf "\r        ${CYAN}%s${NC} %s" "${SPINNER_CHARS:i++%${#SPINNER_CHARS}:1}" "$description"
-        sleep 0.1
-    done
-    
-    # Get exit status
-    wait $pid
-    local exit_code=$?
-    
-    # Clear spinner line and show result
-    printf "\r        "  # Clear the line
-    if [ $exit_code -eq 0 ]; then
-        echo -e "${CHECK} $description"
-        rm -f "$log_file"
-        return 0
-    else
-        echo -e "${CROSS} ${RED}$description${NC}"
-        echo -e "        ${DIM}Log output:${NC}"
-        tail -20 "$log_file" | sed 's/^/        /' 
-        rm -f "$log_file"
-        return 1
-    fi
-}
-
-# Run a command and show immediate output (for long operations)
-run_with_output() {
-    local description="$1"
-    shift
-    local cmd="$@"
-    
-    echo -e "        ${ARROW} $description"
-    echo -e "        ${DIM}─────────────────────────────────────────${NC}"
-    
-    # Run command with indented output
-    if eval "$cmd" 2>&1 | sed 's/^/        /'; then
-        echo -e "        ${DIM}─────────────────────────────────────────${NC}"
-        print_success "$description completed"
-        return 0
-    else
-        echo -e "        ${DIM}─────────────────────────────────────────${NC}"
-        print_error "$description failed"
-        return 1
-    fi
-}
-
-# Show a progress bar (updates in place)
-# Usage: show_progress_bar current total [description]
-show_progress_bar() {
-    local current=$1
-    local total=$2
-    local description="${3:-}"
-    local width=30
-    local percent=$((current * 100 / total))
-    local filled=$((current * width / total))
-    local empty=$((width - filled))
-    
-    # Build the bar
-    local bar=""
-    for ((i=0; i<filled; i++)); do bar+="█"; done
-    for ((i=0; i<empty; i++)); do bar+="░"; done
-    
-    # Print with carriage return to update in place
-    printf "\r        ${CYAN}[${bar}]${NC} ${percent}%% ${DIM}${description}${NC}  "
-}
-
-# Run a long command with elapsed time display
-run_with_elapsed_time() {
-    local description="$1"
-    shift
-    local cmd="$@"
-    local log_file=$(mktemp)
-    local pid
-    local start_time=$(date +%s)
-    
-    # Start command in background
-    eval "$cmd" > "$log_file" 2>&1 &
-    pid=$!
-    
-    # Show elapsed time while command runs
-    printf "        ${ARROW} %s " "$description"
-    while kill -0 $pid 2>/dev/null; do
-        local elapsed=$(($(date +%s) - start_time))
-        local mins=$((elapsed / 60))
-        local secs=$((elapsed % 60))
-        printf "\r        ${CYAN}⏱${NC}  %s ${DIM}(%dm %02ds)${NC}  " "$description" $mins $secs
-        sleep 1
-    done
-    
-    # Get exit status
-    wait $pid
-    local exit_code=$?
-    local elapsed=$(($(date +%s) - start_time))
-    local mins=$((elapsed / 60))
-    local secs=$((elapsed % 60))
-    
-    # Clear line and show result
-    printf "\r        "  # Clear
-    if [ $exit_code -eq 0 ]; then
-        echo -e "${CHECK} $description ${DIM}(${mins}m ${secs}s)${NC}"
-        rm -f "$log_file"
-        return 0
-    else
-        echo -e "${CROSS} ${RED}$description${NC} ${DIM}(${mins}m ${secs}s)${NC}"
-        echo -e "        ${DIM}Log output:${NC}"
-        tail -20 "$log_file" | sed 's/^/        /' 
-        rm -f "$log_file"
-        return 1
-    fi
-}
-
-# Run git clone with real-time progress display
-# Shows actual git progress (objects, files) as they're received
-run_git_clone_with_progress() {
-    local branch="$1"
-    local repo_url="$2"
-    local target_dir="$3"
-    local start_time=$(date +%s)
-    
-    echo -e "        ${ARROW} Cloning from ${CYAN}github.com/rightup/pyMC_Repeater${NC}"
-    echo -e "        ${DIM}────────────────────────────────────────${NC}"
-    
-    # Run git clone with progress, parse and display key lines
-    git clone -b "$branch" --progress "$repo_url" "$target_dir" 2>&1 | while IFS= read -r line; do
-        # Parse git progress output
-        if [[ "$line" =~ ^Cloning ]]; then
-            printf "\r        ${DIM}%-50s${NC}" "Initializing..."
-        elif [[ "$line" =~ ^remote:\ Enumerating ]]; then
-            printf "\r        ${DIM}%-50s${NC}" "Enumerating objects..."
-        elif [[ "$line" =~ ^remote:\ Counting ]]; then
-            printf "\r        ${DIM}%-50s${NC}" "Counting objects..."
-        elif [[ "$line" =~ ^remote:\ Compressing ]]; then
-            # Extract percentage if present
-            if [[ "$line" =~ ([0-9]+)% ]]; then
-                printf "\r        ${CYAN}Compressing:${NC} ${BASH_REMATCH[1]}%%%-30s" " "
-            fi
-        elif [[ "$line" =~ ^Receiving\ objects ]]; then
-            # Extract percentage
-            if [[ "$line" =~ ([0-9]+)% ]]; then
-                printf "\r        ${CYAN}Receiving:${NC}   ${BASH_REMATCH[1]}%%%-30s" " "
-            fi
-        elif [[ "$line" =~ ^Resolving\ deltas ]]; then
-            # Extract percentage
-            if [[ "$line" =~ ([0-9]+)% ]]; then
-                printf "\r        ${CYAN}Resolving:${NC}   ${BASH_REMATCH[1]}%%%-30s" " "
-            fi
-        elif [[ "$line" =~ ^Updating\ files ]]; then
-            # Extract percentage
-            if [[ "$line" =~ ([0-9]+)% ]]; then
-                printf "\r        ${CYAN}Extracting:${NC}  ${BASH_REMATCH[1]}%%%-30s" " "
-            fi
-        fi
-    done
-    
-    local exit_code=${PIPESTATUS[0]}
-    local elapsed=$(($(date +%s) - start_time))
-    
-    # Clear progress line
-    printf "\r%-60s\r" " "
-    echo -e "        ${DIM}────────────────────────────────────────${NC}"
-    
-    if [ $exit_code -eq 0 ]; then
-        print_success "Repository cloned ${DIM}(${elapsed}s)${NC}"
-        return 0
-    else
-        print_error "Clone failed"
-        return 1
-    fi
-}
-
-# Print installation banner
 print_banner() {
     clear
     echo ""
-    echo -e "${BOLD}${CYAN}pyMC Console Installer${NC}"
-    echo -e "${DIM}React Dashboard + LoRa Mesh Network Repeater${NC}"
+    echo -e "${BOLD}${CYAN}pyMC Console${NC}"
+    echo -e "${DIM}React Dashboard for pyMC_Repeater${NC}"
     echo ""
 }
 
-# Print completion summary
-print_completion() {
-    local ip_address="$1"
-    echo ""
-    echo -e "${GREEN}${BOLD}Installation Complete!${NC} ${CHECK}"
-    echo ""
-    
-    # Version and branch summary
-    echo -e "${BOLD}Installed Versions:${NC}"
-    local core_ver=$(get_core_version)
-    local repeater_ver=$(get_repeater_version)
-    local console_ver=$(get_console_version)
-    local repeater_branch=$(get_repeater_branch)
-    local core_branch=$(get_core_branch_from_toml "$CLONE_DIR")
-    echo -e "  ${DIM}pyMC Core:${NC}     ${CYAN}v${core_ver}${NC}  ${DIM}@${core_branch}${NC}"
-    echo -e "  ${DIM}pyMC Repeater:${NC} ${CYAN}v${repeater_ver}${NC}  ${DIM}@${repeater_branch}${NC}"
-    echo -e "  ${DIM}pyMC Console:${NC}  ${CYAN}${console_ver}${NC}"
-    echo ""
-    
-    # Disk usage report
-    echo -e "${BOLD}Disk Usage:${NC}"
-    local install_size=$(du -sh "$REPEATER_DIR" 2>/dev/null | cut -f1 || echo "N/A")
-    local config_size=$(du -sh "$CONFIG_DIR" 2>/dev/null | cut -f1 || echo "N/A")
-    echo -e "  ${DIM}Installation:${NC}  $install_size"
-    echo -e "  ${DIM}Configuration:${NC} $config_size"
-    echo ""
-    
-    echo -e "${BOLD}Access your dashboard:${NC}"
-    echo -e "  ${ARROW} Dashboard: ${CYAN}http://$ip_address:8000/${NC}"
-    echo -e "  ${DIM}(API endpoints also available at /api/*)${NC}"
-    echo ""
-}
+# ─────────────────────────────────────────────────────────────────────────────
+# TUI Setup (whiptail/dialog)
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Cleanup function for error handling
-cleanup_on_error() {
-    echo ""
-    print_error "Installation failed!"
-    echo ""
-    echo -e "  ${YELLOW}Partial installation may remain. To clean up:${NC}"
-    echo -e "  ${DIM}sudo ./manage.sh uninstall${NC}"
-    echo ""
-    echo -e "  ${YELLOW}Check the error messages above for details.${NC}"
-    echo -e "  ${YELLOW}Common issues:${NC}"
-    echo -e "  ${DIM}- Network connectivity problems${NC}"
-    echo -e "  ${DIM}- Missing system dependencies${NC}"
-    echo -e "  ${DIM}- Insufficient disk space${NC}"
-    echo -e "  ${DIM}- Permission issues${NC}"
-    echo ""
-}
-
-# ============================================================================
-# TUI Setup
-# ============================================================================
-
-# Check if running in interactive terminal
-check_terminal() {
-    if [ ! -t 0 ] || [ -z "$TERM" ]; then
-        echo "Error: This script requires an interactive terminal."
-        echo "Please run from SSH or a local terminal."
-        exit 1
-    fi
-}
-
-# Setup dialog/whiptail
 setup_dialog() {
-    if command -v whiptail &> /dev/null; then
+    if command -v whiptail &>/dev/null; then
         DIALOG="whiptail"
-    elif command -v dialog &> /dev/null; then
+    elif command -v dialog &>/dev/null; then
         DIALOG="dialog"
     else
-        echo "TUI interface requires whiptail or dialog."
-        if [ "$EUID" -eq 0 ]; then
-            echo "Installing whiptail..."
-            apt-get update -qq && apt-get install -y whiptail
-            DIALOG="whiptail"
-        else
-            echo ""
-            echo "Please install whiptail: sudo apt-get install -y whiptail"
-            exit 1
-        fi
+        echo "Installing whiptail..."
+        apt-get update -qq && apt-get install -y whiptail
+        DIALOG="whiptail"
     fi
 }
 
-# ============================================================================
-# Dialog Helper Functions
-# ============================================================================
+show_info()   { $DIALOG --backtitle "pyMC Console" --title "$1" --msgbox "$2" 12 60; }
+show_error()  { $DIALOG --backtitle "pyMC Console" --title "Error" --msgbox "$1" 10 60; }
+ask_yes_no()  { $DIALOG --backtitle "pyMC Console" --title "$1" --yesno "$2" 12 60; }
 
-show_info() {
-    $DIALOG --backtitle "pyMC Console Management" --title "$1" --msgbox "$2" 14 70
-}
+# ─────────────────────────────────────────────────────────────────────────────
+# Status Helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
-show_error() {
-    $DIALOG --backtitle "pyMC Console Management" --title "Error" --msgbox "$1" 10 60
-}
+is_installed()    { [[ -d "$INSTALL_DIR" ]] && [[ -f "$INSTALL_DIR/pyproject.toml" ]]; }
+service_running() { systemctl is-active "$SERVICE_NAME" &>/dev/null; }
 
-ask_yes_no() {
-    $DIALOG --backtitle "pyMC Console Management" --title "$1" --yesno "$2" 12 70
-}
-
-get_input() {
-    local title="$1"
-    local prompt="$2"
-    local default="$3"
-    $DIALOG --backtitle "pyMC Console Management" --title "$title" --inputbox "$prompt" 10 70 "$default" 3>&1 1>&2 2>&3
-}
-
-# ============================================================================
-# Status Check Functions
-# ============================================================================
-
-is_installed() {
-    [ -d "$REPEATER_DIR" ] && [ -f "$REPEATER_DIR/pyproject.toml" ]
-}
-
-backend_running() {
-    systemctl is-active "$BACKEND_SERVICE" >/dev/null 2>&1
-}
-
-# Get pymc_core branch/ref from a pyproject.toml file
-# Usage: get_core_branch_from_toml [path_to_dir_with_toml]
-# Returns: branch name (e.g., "feat/anon-req", "main") or "unknown"
-get_core_branch_from_toml() {
-    local dir="${1:-$CLONE_DIR}"
-    local toml_file="$dir/pyproject.toml"
-    
-    if [ ! -f "$toml_file" ]; then
-        echo "unknown"
-        return
-    fi
-    
-    # Extract pymc_core git reference from pyproject.toml
-    # Format: "pymc_core[hardware] @ git+https://github.com/rightup/pyMC_core.git@feat/anon-req"
-    local branch
-    branch=$(grep -i 'pymc_core.*@.*git+' "$toml_file" 2>/dev/null | sed -n 's/.*\.git@\([^"]*\).*/\1/p' | head -1)
-    
-    if [ -n "$branch" ]; then
-        echo "$branch"
-    else
-        echo "unknown"
-    fi
-}
-
-# Get pyMC_Repeater branch from clone directory
-get_repeater_branch() {
-    if [ -d "$CLONE_DIR/.git" ]; then
-        cd "$CLONE_DIR" 2>/dev/null && git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "unknown"
-    else
-        echo "unknown"
-    fi
-}
-
-# Get pyMC Repeater version from pip or pyproject.toml
-# pyMC_Repeater uses setuptools_scm (dynamic versioning from git tags)
-# so we need to check pip for the actual installed version
 get_version() {
-    # First try pip (most accurate for installed package)
-    local version
-    version=$(pip3 show pymc-repeater 2>/dev/null | grep "^Version:" | awk '{print $2}')
-    if [ -n "$version" ]; then
-        echo "$version"
-        return
-    fi
-    
-    # Try alternate package name
-    version=$(pip3 show pymc_repeater 2>/dev/null | grep "^Version:" | awk '{print $2}')
-    if [ -n "$version" ]; then
-        echo "$version"
-        return
-    fi
-    
-    # Fallback: try static version in pyproject.toml (older format)
-    if [ -f "$REPEATER_DIR/pyproject.toml" ]; then
-        # Match 'version = "X.Y.Z"' but not 'version_scheme' or 'dynamic'
-        version=$(grep -E '^version\s*=\s*"' "$REPEATER_DIR/pyproject.toml" 2>/dev/null | cut -d'"' -f2 | head -1)
-        if [ -n "$version" ]; then
-            echo "$version"
-            return
-        fi
-    fi
-    
-    # Check if directory exists but version unknown
-    if [ -d "$REPEATER_DIR" ]; then
-        echo "unknown"
-    else
-        echo "not installed"
-    fi
+    pip3 show pymc-repeater 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "unknown"
 }
 
-# Get pyMC Repeater version (alias for clarity)
-get_repeater_version() {
-    get_version
-}
-
-# Get pymc_core version from installed pip package
-get_core_version() {
-    # Try to get version from pip
-    local version
-    version=$(pip3 show pymc_core 2>/dev/null | grep "^Version:" | awk '{print $2}')
-    if [ -n "$version" ]; then
-        echo "$version"
-    else
-        echo "unknown"
-    fi
-}
-
-# Get pyMC Console (UI) version from installed VERSION file or GitHub API
 get_console_version() {
-    local ui_dir="$UI_DIR"
-    
-    if [ -d "$ui_dir" ]; then
-        # First, try to read VERSION file (created during build)
-        if [ -f "$ui_dir/VERSION" ]; then
-            local ver=$(cat "$ui_dir/VERSION" 2>/dev/null | tr -d '[:space:]')
-            if [ -n "$ver" ]; then
-                echo "v$ver"
-                return 0
-            fi
-        fi
-        
-        # Fallback: check GitHub API for latest release
-        local latest_tag
-        latest_tag=$(curl -s --max-time 3 "https://api.github.com/repos/${UI_REPO}/releases/latest" 2>/dev/null | grep -oP '"tag_name":\s*"\K[^"]+' | head -1)
-        if [ -n "$latest_tag" ]; then
-            echo "$latest_tag"
-        else
-            echo "installed"
-        fi
-    else
-        echo "not installed"
-    fi
+    [[ -f "$UI_DIR/VERSION" ]] && cat "$UI_DIR/VERSION" 2>/dev/null | tr -d '[:space:]' && return
+    echo "unknown"
 }
 
-get_status_display() {
-    if ! is_installed; then
-        echo "Not Installed"
-    else
-        local status="Stopped"
-        backend_running && status="Running"
-        echo "Service: $status"
-    fi
+get_core_version() {
+    pip3 show pymc-core 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "unknown"
 }
 
-# Get full version summary for display
-# Returns multi-line string with all component versions
-get_version_summary() {
+get_repeater_version() {
+    pip3 show pymc-repeater 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "unknown"
+}
+
+print_version_summary() {
     local core_ver=$(get_core_version)
-    local repeater_ver=$(get_repeater_version)
-    local console_ver=$(get_console_version)
-    local core_branch=$(get_core_branch_from_toml "$CLONE_DIR")
-    local repeater_branch=$(get_repeater_branch)
+    local rep_ver=$(get_repeater_version)
+    local ui_ver=$(get_console_version)
     
-    echo "pyMC Core:     v${core_ver} @${core_branch}"
-    echo "pyMC Repeater: v${repeater_ver} @${repeater_branch}"
-    echo "pyMC Console:  ${console_ver}"
+    echo ""
+    echo -e "  ${DIM}Versions:${NC}"
+    echo -e "    pyMC Core:     ${CYAN}$core_ver${NC}"
+    echo -e "    pyMC Repeater: ${CYAN}$rep_ver${NC}"
+    echo -e "    pyMC Console:  ${CYAN}v$ui_ver${NC}"
 }
 
-# ============================================================================
-# Install Function
-# ============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# Git Operations
+# ─────────────────────────────────────────────────────────────────────────────
 
-do_install() {
-    # Check if already installed
-    if is_installed; then
-        show_error "pyMC Console is already installed!\n\npyMC_Repeater: $INSTALL_DIR\n\nUse 'upgrade' to update or 'uninstall' first."
+clone_upstream() {
+    local branch="$1"
+    
+    git config --global --add safe.directory "$CLONE_DIR" 2>/dev/null || true
+    
+    if [[ -d "$CLONE_DIR/.git" ]]; then
+        print_info "Updating existing clone..."
+        cd "$CLONE_DIR"
+        git fetch origin --prune
+        git reset --hard HEAD
+        git checkout "$branch" 2>/dev/null || git checkout -b "$branch" "origin/$branch"
+        git reset --hard "origin/$branch"
+    else
+        print_info "Cloning pyMC_Repeater@$branch..."
+        rm -rf "$CLONE_DIR"
+        git clone -b "$branch" "https://github.com/rightup/pyMC_Repeater.git" "$CLONE_DIR"
+    fi
+    
+    # Show what we got
+    cd "$CLONE_DIR"
+    local commit=$(git rev-parse --short HEAD)
+    local date=$(git log -1 --format=%cd --date=short)
+    print_success "Source: $branch @ $commit ($date)"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Upstream Installer Wrapper
+# ─────────────────────────────────────────────────────────────────────────────
+
+run_upstream() {
+    local action="$1"
+    local upstream_script="$CLONE_DIR/manage.sh"
+    
+    if [[ ! -f "$upstream_script" ]]; then
+        print_error "Upstream manage.sh not found"
         return 1
     fi
     
-    # Check root
-    if [ "$EUID" -ne 0 ]; then
-        show_error "Installation requires root privileges.\n\nPlease run: sudo $0 install"
+    echo ""
+    echo -e "${DIM}─────────────────────────────────────────────────────────${NC}"
+    echo -e "${BOLD}Running pyMC_Repeater $action...${NC}"
+    echo -e "${DIM}─────────────────────────────────────────────────────────${NC}"
+    echo ""
+    
+    (cd "$CLONE_DIR" && bash "$upstream_script" "$action")
+    local exit_code=$?
+    
+    echo ""
+    echo -e "${DIM}─────────────────────────────────────────────────────────${NC}"
+    
+    if [[ $exit_code -eq 0 ]]; then
+        print_success "pyMC_Repeater $action completed"
+        return 0
+    else
+        print_error "pyMC_Repeater $action failed"
+        return 1
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Dashboard Installation
+# ─────────────────────────────────────────────────────────────────────────────
+
+install_dashboard() {
+    local config_file="$CONFIG_DIR/config.yaml"
+    local temp_file="/tmp/pymc-ui-$$.tar.gz"
+    local is_fresh_install=true
+    
+    # Detect fresh install vs upgrade
+    if [[ -d "$CONSOLE_DIR" ]]; then
+        is_fresh_install=false
+    fi
+    
+    # Download dashboard
+    print_info "Downloading dashboard..."
+    if ! curl -fsSL -o "$temp_file" "${UI_RELEASE_URL}/latest/download/pymc-ui-latest.tar.gz"; then
+        print_error "Download failed"
+        rm -f "$temp_file"
+        return 1
+    fi
+    
+    # Clean and extract
+    rm -rf "$UI_DIR"
+    mkdir -p "$UI_DIR"
+    tar -xzf "$temp_file" -C "$UI_DIR"
+    rm -f "$temp_file"
+    
+    # Set permissions
+    chown -R repeater:repeater "$CONSOLE_DIR" 2>/dev/null || true
+    
+    # Configure web_path (fresh install only)
+    if [[ -f "$config_file" ]] && command -v yq &>/dev/null; then
+        # Ensure web section exists
+        yq -i '.web //= {}' "$config_file" 2>/dev/null || true
+        
+        if [[ "$is_fresh_install" == true ]]; then
+            yq -i ".web.web_path = \"$UI_DIR\"" "$config_file"
+            print_success "Dashboard installed (web_path configured)"
+        else
+            print_success "Dashboard updated (web_path preserved)"
+        fi
+    else
+        print_warning "Could not configure web_path - set manually in $config_file"
+    fi
+    
+    local size=$(du -sh "$UI_DIR" 2>/dev/null | cut -f1)
+    print_info "Size: $size"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Install
+# ─────────────────────────────────────────────────────────────────────────────
+
+do_install() {
+    if [[ "$EUID" -ne 0 ]]; then
+        show_error "Installation requires root.\n\nRun: sudo $0 install"
+        return 1
+    fi
+    
+    # Check if pyMC_Repeater already installed
+    local repeater_exists=false
+    is_installed && repeater_exists=true
+    
+    # Installation type selection (interactive only)
+    local install_type="${1:-}"
+    if [[ -z "$install_type" ]]; then
+        if [[ "$repeater_exists" == true ]]; then
+            # Repeater exists - only offer console
+            install_type="console"
+            show_info "Existing Installation" "pyMC_Repeater detected.\n\nInstalling Console dashboard only."
+        else
+            # Fresh system - offer choice
+            install_type=$($DIALOG --backtitle "pyMC Console" --title "Installation Type" --menu \
+                "\nSelect what to install:" 14 55 2 \
+                "full"    "Full Stack (pyMC_Repeater + Console)" \
+                "console" "Console Only (dashboard for existing install)" \
+                3>&1 1>&2 2>&3) || return 0
+        fi
+    fi
+    
+    case "$install_type" in
+        full)    do_install_full ;;
+        console) do_install_console ;;
+        *)       show_error "Unknown install type: $install_type"; return 1 ;;
+    esac
+}
+
+do_install_full() {
+    if is_installed; then
+        show_error "pyMC_Repeater already installed.\n\nUse 'upgrade' or choose Console-only install."
         return 1
     fi
     
     # Branch selection
-    local branch="${1:-}"
-    if [ -z "$branch" ]; then
-        branch=$($DIALOG --backtitle "pyMC Console Management" --title "Select Branch" --menu "\nSelect the pyMC_Repeater branch to install:" 15 65 4 \
-            "dev" "Development branch (recommended)" \
-            "main" "Stable release" \
-            "feat/dmg" "DMG branch (experimental)" \
-            "custom" "Enter custom branch name" 3>&1 1>&2 2>&3)
-        
-        if [ -z "$branch" ]; then
-            return 0  # User cancelled
-        fi
-        
-        if [ "$branch" = "custom" ]; then
-            branch=$(get_input "Custom Branch" "Enter the branch name:" "dev")
-            if [ -z "$branch" ]; then
-                return 0
-            fi
-        fi
+    local branch
+    branch=$($DIALOG --backtitle "pyMC Console" --title "Select Branch" --menu \
+        "\nSelect pyMC_Repeater branch:" 14 50 3 \
+        "dev"  "Development (recommended)" \
+        "main" "Stable release" \
+        "custom" "Enter custom branch" 3>&1 1>&2 2>&3) || return 0
+    
+    if [[ "$branch" == "custom" ]]; then
+        branch=$($DIALOG --backtitle "pyMC Console" --inputbox "Branch name:" 8 40 "dev" 3>&1 1>&2 2>&3) || return 0
     fi
     
-    # Welcome screen
-    $DIALOG --backtitle "pyMC Console Management" --title "Welcome" --msgbox "\nWelcome to pyMC Console Setup\n\nThis will install:\n- pyMC Repeater (LoRa mesh repeater)\n- pyMC Console (React dashboard)\n\nBranch: $branch\nClone: $CLONE_DIR\nInstall: $INSTALL_DIR\n\nPress OK to continue..." 18 70
-    
-    # SPI Check (Raspberry Pi)
-    check_spi
-    
-    # Set up error handling
-    trap cleanup_on_error ERR
-    
-    # Print banner
     print_banner
+    echo -e "  ${DIM}Mode: Full Stack${NC}"
     echo -e "  ${DIM}Branch: $branch${NC}"
-    echo -e "  ${DIM}Clone: $CLONE_DIR${NC}"
-    echo -e "  ${DIM}Install: $INSTALL_DIR${NC}"
     
-    local total_steps=5
+    # Step 1: Clone upstream
+    print_step 1 3 "Preparing pyMC_Repeater"
+    clone_upstream "$branch"
     
-    # =========================================================================
-    # Step 1: Install prerequisites (whiptail needed by upstream)
-    # =========================================================================
-    print_step 1 $total_steps "Installing prerequisites"
+    # Step 2: Run upstream installer
+    print_step 2 3 "Installing pyMC_Repeater"
+    run_upstream "install" || return 1
     
-    run_with_spinner "Updating package lists" "apt-get update -qq" || {
-        print_error "Failed to update package lists"
-        return 1
-    }
+    # Step 3: Overlay dashboard
+    print_step 3 3 "Installing dashboard"
+    install_dashboard
     
-    # Install whiptail (needed by upstream) and git
-    run_with_spinner "Installing required packages" "apt-get install -y whiptail git curl" || {
-        print_error "Failed to install prerequisites"
-        return 1
-    }
-    
-    # Install yq (we use it for config manipulation)
-    if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
-        run_with_spinner "Installing yq" "install_yq_silent" || print_warning "yq installation failed (non-critical)"
-    else
-        print_success "yq already installed"
-    fi
-    
-    # =========================================================================
-    # Step 2: Clone pyMC_Repeater
-    # =========================================================================
-    print_step 2 $total_steps "Cloning pyMC_Repeater@$branch"
-    
-    # Remove existing clone if present (fresh install)
-    if [ -d "$CLONE_DIR" ]; then
-        print_info "Removing existing clone at $CLONE_DIR"
-        rm -rf "$CLONE_DIR"
-    fi
-    
-    # Mark directories as safe for git (running as root on user-owned dir)
-    git config --global --add safe.directory "$CLONE_DIR" 2>/dev/null || true
-    git config --global --add safe.directory "$INSTALL_DIR" 2>/dev/null || true
-    
-    run_git_clone_with_progress "$branch" "https://github.com/rightup/pyMC_Repeater.git" "$CLONE_DIR" || {
-        print_error "Failed to clone pyMC_Repeater"
-        print_info "Check if branch '$branch' exists"
-        return 1
-    }
-    
-    # Show verified git info so user can confirm what was cloned
-    cd "$CLONE_DIR"
-    local git_branch=$(git rev-parse --abbrev-ref HEAD)
-    local git_commit=$(git rev-parse --short HEAD)
-    local git_date=$(git log -1 --format=%cd --date=short)
-    local git_msg=$(git log -1 --format=%s | cut -c1-50)
-    echo -e "        ${BOLD}Source Verification${NC}"
-    echo -e "        Branch:  ${CYAN}${git_branch}${NC}"
-    echo -e "        Commit:  ${CYAN}${git_commit}${NC} ${DIM}(${git_date})${NC}"
-    echo -e "        Message: ${DIM}${git_msg}...${NC}"
+    # Done
+    local ip=$(hostname -I 2>/dev/null | awk '{print $1}')
     echo ""
-    
-    # =========================================================================
-    # Step 3: Run upstream installer (via UPSTREAM INSTALLATION MANAGER)
-    # =========================================================================
-    print_step 3 $total_steps "Running pyMC_Repeater installer"
-    
-    # This runs upstream's manage.sh install with our fake dialog to bypass TUI
-    # Upstream handles: user creation, directories, deps, pip install, service, config
-    run_upstream_installer "install" "$branch" || {
-        print_error "Upstream installation failed"
-        return 1
-    }
-    
-    # =========================================================================
-    # Step 4: Install dashboard and console extras
-    # =========================================================================
-    print_step 4 $total_steps "Installing pyMC Console dashboard"
-    
-    # Create console directory for our extras
-    mkdir -p "$CONSOLE_DIR"
-    
-    # Copy radio settings files to console dir
-    if [ -f "$CLONE_DIR/radio-settings.json" ]; then
-        cp "$CLONE_DIR/radio-settings.json" "$CONSOLE_DIR/"
-        print_success "Copied radio-settings.json"
-    fi
-    
-    if [ -f "$CLONE_DIR/radio-presets.json" ]; then
-        cp "$CLONE_DIR/radio-presets.json" "$CONSOLE_DIR/"
-        print_success "Copied radio-presets.json"
-    fi
-    
-    # Install our React dashboard (overlays upstream's Vue.js frontend)
-    install_static_frontend || {
-        print_error "Frontend installation failed"
-        return 1
-    }
-    
-    # Fix permissions for console directory
-    chown -R "$SERVICE_USER:$SERVICE_USER" "$CONSOLE_DIR" 2>/dev/null || true
-    
-    # =========================================================================
-    # Step 5: Finalize installation
-    # =========================================================================
-    print_step 5 $total_steps "Finalizing installation"
-    
-    # Stop service for now - we'll start it after user configures radio
-    # Upstream may have started it, so stop to avoid running with default config
-    systemctl stop "$BACKEND_SERVICE" 2>/dev/null || true
-    print_success "Installation files ready"
-    print_info "Service will start after radio configuration"
-    
-    # Clear error trap
-    trap - ERR
-    
-    # =========================================================================
-    # Radio Configuration (terminal-based)
-    # =========================================================================
+    echo -e "${GREEN}${BOLD}Installation Complete!${NC}"
+    print_version_summary
     echo ""
-    echo -e "${BOLD}${CYAN}Radio Configuration${NC}"
-    echo -e "${DIM}Configure your radio settings for your region and hardware${NC}"
+    echo -e "  Dashboard: ${CYAN}http://$ip:8000/${NC}"
     echo ""
-    
-    configure_radio_terminal
-    
-    # NOW start the service with user's configuration
-    print_info "Starting service with your configuration..."
-    systemctl daemon-reload
-    systemctl start "$BACKEND_SERVICE" 2>/dev/null || true
-    sleep 2
-    if backend_running; then
-        print_success "Backend service running"
-    else
-        print_warning "Service may need GPIO configuration - use './manage.sh gpio'"
-    fi
-    
-    # Show completion
-    local ip_address=$(hostname -I | awk '{print $1}')
-    print_completion "$ip_address"
-    
-    echo -e "${BOLD}Manage your installation:${NC}"
-    echo -e "  ${DIM}./manage.sh settings${NC}  - Configure radio"
-    echo -e "  ${DIM}./manage.sh gpio${NC}      - Configure GPIO pins"
-    echo -e "  ${DIM}./manage.sh${NC}           - Full management menu"
+    echo -e "  ${DIM}Configure radio: cd $CLONE_DIR && sudo ./manage.sh${NC}"
     echo ""
 }
 
-# ============================================================================
-# Upgrade Function
-# ============================================================================
+do_install_console() {
+    if ! is_installed; then
+        show_error "pyMC_Repeater not found.\n\nUse Full Stack install or install pyMC_Repeater first."
+        return 1
+    fi
+    
+    if [[ -d "$UI_DIR" ]]; then
+        if ! ask_yes_no "Console Exists" "Console dashboard already installed.\n\nReinstall?"; then
+            return 0
+        fi
+    fi
+    
+    print_banner
+    echo -e "  ${DIM}Mode: Console Only${NC}"
+    
+    # Single step: Install dashboard
+    print_step 1 1 "Installing dashboard"
+    install_dashboard
+    
+    # Done
+    local ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    echo ""
+    echo -e "${GREEN}${BOLD}Console Installed!${NC}"
+    echo ""
+    echo -e "  ${DIM}Versions:${NC}"
+    echo -e "    pyMC Console:  ${CYAN}v$(get_console_version)${NC}"
+    echo ""
+    echo -e "  Dashboard: ${CYAN}http://$ip:8000/${NC}"
+    echo ""
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Upgrade
+# ─────────────────────────────────────────────────────────────────────────────
 
 do_upgrade() {
     if ! is_installed; then
-        show_error "pyMC Console is not installed!\n\nUse 'install' first."
+        show_error "Not installed. Use 'install' first."
         return 1
     fi
     
-    if [ "$EUID" -ne 0 ]; then
-        show_error "Upgrade requires root privileges.\n\nPlease run: sudo $0 upgrade"
+    if [[ "$EUID" -ne 0 ]]; then
+        show_error "Upgrade requires root.\n\nRun: sudo $0 upgrade"
         return 1
     fi
     
-    # Self-update: pull latest pymc_console repo first, then re-exec if updated
-    local script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    if [ -d "$script_dir/.git" ]; then
-        echo ""
+    # Self-update pymc_console repo
+    if [[ -d "$SCRIPT_DIR/.git" ]]; then
         print_info "Checking for pymc_console updates..."
-        git config --global --add safe.directory "$script_dir" 2>/dev/null || true
-        cd "$script_dir"
-        
-        # Check if there are updates available
+        cd "$SCRIPT_DIR"
+        git config --global --add safe.directory "$SCRIPT_DIR" 2>/dev/null || true
         git fetch origin 2>/dev/null || true
+        
         local local_hash=$(git rev-parse HEAD 2>/dev/null)
-        local remote_hash=$(git rev-parse origin/main 2>/dev/null || git rev-parse origin/master 2>/dev/null)
+        local remote_hash=$(git rev-parse origin/main 2>/dev/null)
         
-        if [ -n "$remote_hash" ] && [ "$local_hash" != "$remote_hash" ]; then
-            print_info "Updates available, pulling..."
-            # Try fast-forward first, fall back to reset if history diverged (e.g., after force-push)
-            if git pull --ff-only 2>/dev/null; then
-                print_success "pymc_console updated - restarting with new version..."
-                echo ""
-                exec "$script_dir/manage.sh" upgrade
-            elif git reset --hard "origin/main" 2>/dev/null || git reset --hard "origin/master" 2>/dev/null; then
-                print_success "pymc_console synced (history was rewritten) - restarting..."
-                echo ""
-                exec "$script_dir/manage.sh" upgrade
-            else
-                print_warning "Could not auto-update pymc_console (continuing with current version)"
-                print_info "You may need to manually run: cd $script_dir && git fetch && git reset --hard origin/main"
+        if [[ -n "$remote_hash" && "$local_hash" != "$remote_hash" ]]; then
+            if git pull --ff-only 2>/dev/null || git reset --hard origin/main 2>/dev/null; then
+                print_success "pymc_console updated - restarting..."
+                exec "$SCRIPT_DIR/manage.sh" upgrade
             fi
-        else
-            print_success "pymc_console is up to date"
         fi
-        echo ""
     fi
     
-    # Capture current versions BEFORE upgrade
-    local current_repeater_ver=$(get_repeater_version)
-    local current_core_ver=$(get_core_version)
-    local current_console_ver=$(get_console_version)
+    # Capture current versions before upgrade
+    local core_before=$(get_core_version)
+    local rep_before=$(get_repeater_version)
+    local ui_before=$(get_console_version)
     
-    # Get current branch from clone directory or default to feat/dmg
-    local current_branch="$DEFAULT_BRANCH"
-    if [ -d "$CLONE_DIR/.git" ]; then
-        cd "$CLONE_DIR" 2>/dev/null || true
-        current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "$DEFAULT_BRANCH")
+    # Get current branch
+    local branch="$DEFAULT_BRANCH"
+    if [[ -d "$CLONE_DIR/.git" ]]; then
+        branch=$(cd "$CLONE_DIR" && git rev-parse --abbrev-ref HEAD 2>/dev/null) || branch="$DEFAULT_BRANCH"
     fi
     
-    # Show current versions and upgrade type selection
-    local upgrade_type
-    upgrade_type=$($DIALOG --backtitle "pyMC Console Management" --title "Upgrade Options" --menu "
- Current Installed Versions:
- ─────────────────────────────────────
-   pyMC Core:      v${current_core_ver}
-   pyMC Repeater:  v${current_repeater_ver}
-   pyMC Console:   ${current_console_ver}
- ─────────────────────────────────────
-
- Select upgrade type:" 19 65 2 \
-        "<Console>" "Console Only" \
-        "<Package>" "Full pyMC Stack" 3>&1 1>&2 2>&3)
+    # Component selection checklist
+    local choices
+    choices=$($DIALOG --backtitle "pyMC Console" --title "Select Components" \
+        --checklist "\nSelect what to upgrade:\n\nYour configuration will be preserved." 14 55 2 \
+        "console"  "pyMC Console dashboard" ON \
+        "repeater" "pyMC_Repeater ($branch)" ON \
+        3>&1 1>&2 2>&3) || return 0
     
-    if [ -z "$upgrade_type" ]; then
+    local upgrade_console=false
+    local upgrade_repeater=false
+    [[ "$choices" == *"console"* ]] && upgrade_console=true
+    [[ "$choices" == *"repeater"* ]] && upgrade_repeater=true
+    
+    # Nothing selected
+    if [[ "$upgrade_console" == false && "$upgrade_repeater" == false ]]; then
+        show_info "Nothing Selected" "No components selected for upgrade."
         return 0
     fi
     
-    local branch="$current_branch"
-    local skip_backend=false
-    
-    if [ "$upgrade_type" = "<Console>" ]; then
-        # Console-only upgrade
-        skip_backend=true
-        
-        if ! ask_yes_no "Confirm Console Upgrade" "
-This will ONLY update the pyMC Console dashboard.
-
-pyMC Core and pyMC Repeater will NOT be modified.
-
-Current Console: ${current_console_ver}
-New Console:     Latest from GitHub
-
-Continue?"; then
-            return 0
-        fi
-    else
-        # Full upgrade - select branch
-        branch=$($DIALOG --backtitle "pyMC Console Management" --title "Select Branch" --menu "
- Full upgrade will update:
-   • pyMC Core (mesh library)
-   • pyMC Repeater (backend)
-   • pyMC Console (dashboard)
-
- Current branch: $current_branch
-
- Select the branch for pyMC Repeater:" 19 65 5 \
-            "dev" "Development branch (recommended)" \
-            "main" "Stable release" \
-            "feat/dmg" "DMG branch (experimental)" \
-            "keep" "Keep current branch ($current_branch)" \
-            "custom" "Enter custom branch name" 3>&1 1>&2 2>&3)
-        
-        if [ -z "$branch" ]; then
-            return 0  # User cancelled
-        fi
-        
-        if [ "$branch" = "keep" ]; then
-            branch="$current_branch"
-        elif [ "$branch" = "custom" ]; then
-            branch=$(get_input "Custom Branch" "Enter the branch name:" "$current_branch")
-            if [ -z "$branch" ]; then
-                return 0
-            fi
-        fi
-        
-        if ! ask_yes_no "Confirm Full Upgrade" "
-This will update ALL components:
-
-  pyMC Core:     v${current_core_ver} → (via pip)
-  pyMC Repeater: v${current_repeater_ver} → $branch branch
-  pyMC Console:  ${current_console_ver} → Latest
-
-Your configuration will be preserved.
-
-Continue?"; then
-            return 0
-        fi
-    fi
-    
-    # Print banner
     print_banner
-    if [ "$skip_backend" = true ]; then
-        echo -e "  ${DIM}Upgrade type: Console Only${NC}"
-    else
-        echo -e "  ${DIM}Upgrade type: Full (Core + Repeater + Console)${NC}"
-        echo -e "  ${DIM}Target branch: $branch${NC}"
+    
+    # Calculate steps
+    local step=1
+    local total=0
+    [[ "$upgrade_repeater" == true ]] && ((total+=2))  # clone + upgrade
+    [[ "$upgrade_console" == true ]] && ((total++))
+    
+    # Upgrade Repeater if selected
+    if [[ "$upgrade_repeater" == true ]]; then
+        print_step $step $total "Updating pyMC_Repeater source"
+        clone_upstream "$branch"
+        ((step++))
+        
+        print_step $step $total "Upgrading pyMC_Repeater"
+        run_upstream "upgrade" || return 1
+        ((step++))
     fi
+    
+    # Upgrade Console if selected
+    if [[ "$upgrade_console" == true ]]; then
+        print_step $step $total "Updating dashboard"
+        install_dashboard
+    fi
+    
+    # Done
+    local ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    local core_after=$(get_core_version)
+    local rep_after=$(get_repeater_version)
+    local ui_after=$(get_console_version)
+    
     echo ""
-    echo -e "  ${BOLD}Current Versions:${NC}"
-    echo -e "  ${DIM}pyMC Core:${NC}     v${current_core_ver}"
-    echo -e "  ${DIM}pyMC Repeater:${NC} v${current_repeater_ver}"
-    echo -e "  ${DIM}pyMC Console:${NC}  ${current_console_ver}"
-    
-    local total_steps
-    if [ "$skip_backend" = true ]; then
-        total_steps=3
-    else
-        total_steps=5
-    fi
-    
-    local step_num=0
-    
-    # =========================================================================
-    # Step 1: Backup configuration (both paths)
-    # =========================================================================
-    ((step_num++)) || true
-    print_step $step_num $total_steps "Backing up configuration"
-    local backup_file="$CONFIG_DIR/config.yaml.backup.$(date +%Y%m%d_%H%M%S)"
-    if [ -f "$CONFIG_DIR/config.yaml" ]; then
-        cp "$CONFIG_DIR/config.yaml" "$backup_file"
-        print_success "Backup saved to: $backup_file"
-    else
-        print_info "No existing config to backup"
-    fi
-    
-    # =========================================================================
-    # CONSOLE-ONLY PATH: Skip backend, just update dashboard
-    # =========================================================================
-    if [ "$skip_backend" = true ]; then
-        # Step 2: Update dashboard only
-        ((step_num++)) || true
-        print_step $step_num $total_steps "Updating pyMC Console dashboard"
-        install_static_frontend || {
-            print_error "Dashboard update failed"
-            return 1
-        }
-        
-        # Step 3: Restart service
-        ((step_num++)) || true
-        print_step $step_num $total_steps "Restarting service"
-        systemctl restart "$BACKEND_SERVICE" 2>/dev/null || true
-        sleep 2
-        if backend_running; then
-            print_success "Service running"
-        else
-            print_warning "Service may need configuration"
-        fi
-        
-        # Show completion (console only)
-        local new_console_ver=$(get_console_version)
-        local ip_address=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
-        
-        echo ""
-        echo -e "${BOLD}${GREEN}════════════════════════════════════════════════════════════${NC}"
-        echo -e "${BOLD}${GREEN}  Console Upgrade Complete!${NC}"
-        echo -e "${BOLD}${GREEN}════════════════════════════════════════════════════════════${NC}"
-        echo ""
-    # Get branch info
-    local repeater_branch=$(get_repeater_branch)
-    local core_branch=$(get_core_branch_from_toml "$CLONE_DIR")
-    
-    echo -e "  ${BOLD}Versions:${NC}"
-    echo -e "  ${DIM}pyMC Core:${NC}     v${current_core_ver} ${DIM}(unchanged)${NC}  ${DIM}@${core_branch}${NC}"
-    echo -e "  ${DIM}pyMC Repeater:${NC} v${current_repeater_ver} ${DIM}(unchanged)${NC}  ${DIM}@${repeater_branch}${NC}"
-    echo -e "  ${CHECK} pyMC Console:  ${DIM}${current_console_ver}${NC} → ${CYAN}${new_console_ver}${NC}"
+    echo -e "${GREEN}${BOLD}Upgrade Complete!${NC}"
     echo ""
-    echo -e "  ${CHECK} Configuration preserved"
-    echo -e "  ${CHECK} Dashboard: ${CYAN}http://$ip_address:8000${NC}"
-        echo ""
+    echo -e "  ${DIM}Versions:${NC}"
+    [[ "$core_before" != "$core_after" ]] \
+        && echo -e "    pyMC Core:     ${DIM}$core_before${NC} → ${CYAN}$core_after${NC}" \
+        || echo -e "    pyMC Core:     ${CYAN}$core_after${NC}"
+    [[ "$rep_before" != "$rep_after" ]] \
+        && echo -e "    pyMC Repeater: ${DIM}$rep_before${NC} → ${CYAN}$rep_after${NC}" \
+        || echo -e "    pyMC Repeater: ${CYAN}$rep_after${NC}"
+    [[ "$ui_before" != "$ui_after" ]] \
+        && echo -e "    pyMC Console:  ${DIM}v$ui_before${NC} → ${CYAN}v$ui_after${NC}" \
+        || echo -e "    pyMC Console:  ${CYAN}v$ui_after${NC}"
+    echo ""
+    echo -e "  Dashboard: ${CYAN}http://$ip:8000/${NC}"
+    echo ""
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Uninstall
+# ─────────────────────────────────────────────────────────────────────────────
+
+do_uninstall() {
+    # Check if there's anything to uninstall
+    local has_repeater=false
+    local has_console=false
+    local has_clone=false
+    local has_self=true  # Script is always running from somewhere
+    
+    is_installed && has_repeater=true
+    [[ -d "$CONSOLE_DIR" ]] && has_console=true
+    [[ -d "$CLONE_DIR" ]] && has_clone=true
+    
+    # Debug: show what we found
+    print_banner
+    echo -e "  ${DIM}Detected components:${NC}"
+    echo -e "    Repeater:  $([[ "$has_repeater" == true ]] && echo "${GREEN}found${NC}" || echo "${DIM}not found${NC}")"
+    echo -e "    Console:   $([[ "$has_console" == true ]] && echo "${GREEN}found${NC} ($CONSOLE_DIR)" || echo "${DIM}not found${NC}")"
+    echo -e "    Clone:     $([[ "$has_clone" == true ]] && echo "${GREEN}found${NC} ($CLONE_DIR)" || echo "${DIM}not found${NC}")"
+    echo -e "    This repo: ${GREEN}$SCRIPT_DIR${NC}"
+    echo ""
+    
+    if [[ "$EUID" -ne 0 ]]; then
+        show_error "Uninstall requires root.\n\nRun: sudo $0 uninstall"
+        return 1
+    fi
+    
+    # Build description of what will be removed
+    local will_remove=""
+    [[ "$has_repeater" == true ]] && will_remove+="• pyMC_Repeater\n"
+    [[ "$has_console" == true ]] && will_remove+="• Console dashboard ($CONSOLE_DIR)\n"
+    [[ "$has_clone" == true ]] && will_remove+="• pyMC_Repeater clone ($CLONE_DIR)\n"
+    will_remove+="• pymc_console repo ($SCRIPT_DIR)"
+    
+    if ! ask_yes_no "Confirm Uninstall" "\nThis will remove:\n${will_remove}\n\nContinue?"; then
         return 0
     fi
     
-    # =========================================================================
-    # FULL UPGRADE PATH: Update Repeater, Core, and Console
-    # =========================================================================
+    print_banner
     
-    # Step 2: Update pyMC_Repeater clone
-    ((step_num++)) || true
-    print_step $step_num $total_steps "Updating pyMC_Repeater@$branch"
+    # Calculate steps: repeater(optional) + console + clone(optional) + self
+    local step=1
+    local total=1  # self is always counted
+    [[ "$has_repeater" == true ]] && ((total++))
+    [[ "$has_console" == true ]] && ((total++))
+    [[ "$has_clone" == true ]] && ((total++))
     
-    # Mark directories as safe for git (running as root on user-owned dir)
-    git config --global --add safe.directory "$CLONE_DIR" 2>/dev/null || true
-    git config --global --add safe.directory "$INSTALL_DIR" 2>/dev/null || true
-    
-    # If clone doesn't exist, clone fresh
-    if [ ! -d "$CLONE_DIR/.git" ]; then
-        print_info "Clone not found, creating fresh clone..."
-        rm -rf "$CLONE_DIR" 2>/dev/null || true
-        run_git_clone_with_progress "$branch" "https://github.com/rightup/pyMC_Repeater.git" "$CLONE_DIR" || {
-            print_error "Failed to clone pyMC_Repeater"
-            return 1
-        }
-    else
-        cd "$CLONE_DIR"
-        
-        run_with_spinner "Fetching updates" "git fetch origin --prune" || {
-            print_error "Failed to fetch updates"
-            return 1
-        }
-        
-        # Reset any local changes (from previous patches)
-        git reset --hard HEAD 2>/dev/null || true
-        git clean -fd 2>/dev/null || true
-        
-        # Switch to the target branch
-        # First try to checkout existing branch, if that fails create tracking branch
-        if ! git checkout "$branch" 2>/dev/null; then
-            # Branch doesn't exist locally, create it tracking origin
-            if git checkout -b "$branch" "origin/$branch" 2>/dev/null; then
-                print_success "Switched to new branch: $branch"
-            else
-                print_error "Branch '$branch' not found on remote"
-                print_info "Available branches: $(git branch -r | grep -v HEAD | sed 's/origin\///' | tr '\n' ' ')"
-                return 1
-            fi
-        fi
-        
-        # Pull latest changes (use reset to handle any divergence)
-        run_with_spinner "Pulling latest changes" "git reset --hard origin/$branch" || {
-            print_error "Failed to pull branch $branch"
-            return 1
-        }
-        print_success "Repository updated to $branch"
-    fi
-    
-    # Show verified git info so user can confirm what was pulled
-    cd "$CLONE_DIR"
-    local git_branch=$(git rev-parse --abbrev-ref HEAD)
-    local git_commit=$(git rev-parse --short HEAD)
-    local git_date=$(git log -1 --format=%cd --date=short)
-    local git_msg=$(git log -1 --format=%s | cut -c1-50)
-    echo -e "        ${BOLD}Source Verification${NC}"
-    echo -e "        Branch:  ${CYAN}${git_branch}${NC}"
-    echo -e "        Commit:  ${CYAN}${git_commit}${NC} ${DIM}(${git_date})${NC}"
-    echo -e "        Message: ${DIM}${git_msg}...${NC}"
-    echo ""
-    
-    # Step 3: Run upstream upgrade (Repeater + Core via pip)
-    ((step_num++)) || true
-    print_step $step_num $total_steps "Running pyMC_Repeater upgrade (includes pyMC Core)"
-    
-    # This runs upstream's manage.sh upgrade with our fake dialog to bypass TUI
-    # Upstream handles: stopping service, updating files, pip install, config merge, starting service
-    run_upstream_installer "upgrade" "$branch" || {
-        print_error "Upstream upgrade failed"
-        return 1
-    }
-    
-    # Step 4: Update dashboard
-    ((step_num++)) || true
-    print_step $step_num $total_steps "Updating dashboard"
-
-    # Ensure --log-level DEBUG
-    if [ -f /etc/systemd/system/pymc-repeater.service ]; then
-        if ! grep -q '\-\-log-level DEBUG' /etc/systemd/system/pymc-repeater.service; then
-            sed -i 's|--config /etc/pymc_repeater/config.yaml$|--config /etc/pymc_repeater/config.yaml --log-level DEBUG|' \
-                /etc/systemd/system/pymc-repeater.service
+    # Step: Run upstream uninstall (if Repeater installed)
+    if [[ "$has_repeater" == true ]]; then
+        print_step $step $total "Removing pyMC_Repeater"
+        if [[ -f "$CLONE_DIR/manage.sh" ]]; then
+            # Run upstream in completely separate bash process
+            # Use script -q to capture and isolate the entire session
+            bash -c 'cd "'"$CLONE_DIR"'" && bash manage.sh uninstall' </dev/tty || true
+        else
+            # Manual cleanup if upstream not available
+            systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+            systemctl disable "$SERVICE_NAME" 2>/dev/null || true
+            rm -f /etc/systemd/system/pymc-repeater.service
             systemctl daemon-reload
-            print_success "Added --log-level DEBUG for RX timing fix"
+            rm -rf "$INSTALL_DIR" "$CONFIG_DIR" /var/log/pymc_repeater
+            pip3 uninstall -y pymc_repeater pymc_core 2>/dev/null || true
+            userdel repeater 2>/dev/null || true
         fi
+        print_success "pyMC_Repeater removed"
+        ((step++))
     fi
     
-    # Update dashboard from GitHub Releases
-    install_static_frontend || {
-        print_warning "Dashboard update failed - service will continue with existing UI"
-    }
-    
-    # Step 5: Restart service with patches
-    ((step_num++)) || true
-    print_step $step_num $total_steps "Restarting service"
-    
-    systemctl restart "$BACKEND_SERVICE" 2>/dev/null || true
-    sleep 2
-    
-    if backend_running; then
-        print_success "Service running"
-    else
-        print_warning "Service may need configuration"
+    # Step: Remove dashboard overlay (if exists)
+    if [[ "$has_console" == true ]]; then
+        print_step $step $total "Removing dashboard"
+        rm -rf "$CONSOLE_DIR"
+        print_success "Dashboard removed ($CONSOLE_DIR)"
+        ((step++))
     fi
     
-    # Show completion with version details (all components)
-    local new_repeater_ver=$(get_repeater_version)
-    local new_core_ver=$(get_core_version)
-    local new_console_ver=$(get_console_version)
-    local ip_address=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
+    # Step: Remove clone
+    if [[ "$has_clone" == true ]]; then
+        print_step $step $total "Removing pyMC_Repeater clone"
+        rm -rf "$CLONE_DIR"
+        print_success "Clone removed ($CLONE_DIR)"
+        ((step++))
+    fi
+    
+    # Step: Remove pymc_console repo itself (scheduled for after script exits)
+    print_step $step $total "Removing pymc_console repo"
+    echo -e "    ${YELLOW}Will remove $SCRIPT_DIR after script exits${NC}"
+    trap "rm -rf '$SCRIPT_DIR'" EXIT
+    print_success "Scheduled for removal"
     
     echo ""
-    echo -e "${BOLD}${GREEN}════════════════════════════════════════════════════════════${NC}"
-    echo -e "${BOLD}${GREEN}  Full Upgrade Complete!${NC}"
-    echo -e "${BOLD}${GREEN}════════════════════════════════════════════════════════════${NC}"
-    echo ""
-    # Get branch info from the updated clone
-    local core_branch=$(get_core_branch_from_toml "$CLONE_DIR")
-    local repeater_branch=$(get_repeater_branch)
-    
-    echo -e "  ${BOLD}Versions:${NC}"
-    echo -e "  ${CHECK} pyMC Core:     ${DIM}v${current_core_ver}${NC} → ${CYAN}v${new_core_ver}${NC}  ${DIM}@${core_branch}${NC}"
-    echo -e "  ${CHECK} pyMC Repeater: ${DIM}v${current_repeater_ver}${NC} → ${CYAN}v${new_repeater_ver}${NC}  ${DIM}@${repeater_branch}${NC}"
-    echo -e "  ${CHECK} pyMC Console:  ${DIM}${current_console_ver}${NC} → ${CYAN}${new_console_ver}${NC}"
-    echo ""
-    echo -e "  ${CHECK} Configuration preserved"
-    echo -e "  ${CHECK} Dashboard: ${CYAN}http://$ip_address:8000${NC}"
+    echo -e "${GREEN}${BOLD}Uninstall Complete${NC}"
     echo ""
 }
 
-# ============================================================================
-# Terminal-based Radio Configuration (for install flow)
-# ============================================================================
-
-configure_radio_terminal() {
-    local config_file="$CONFIG_DIR/config.yaml"
-    
-    if [ ! -f "$config_file" ]; then
-        print_warning "Config file not found, skipping radio configuration"
-        return 0
-    fi
-    
-    # Node name
-    local current_name=$(yq '.repeater.node_name' "$config_file" 2>/dev/null || echo "mesh-repeater")
-    local random_suffix=$(printf "%04d" $((RANDOM % 10000)))
-    local default_name="pyRpt${random_suffix}"
-    
-    if [ "$current_name" = "mesh-repeater-01" ] || [ "$current_name" = "mesh-repeater" ]; then
-        current_name="$default_name"
-    fi
-    
-    echo -e "  ${BOLD}Node Name${NC}"
-    read -p "  Enter repeater name [$current_name]: " node_name
-    node_name=${node_name:-$current_name}
-    yq -i ".repeater.node_name = \"$node_name\"" "$config_file"
-    print_success "Node name: $node_name"
-    echo ""
-    
-    # Radio preset selection
-    echo -e "  ${BOLD}Radio Preset${NC}"
-    echo -e "  ${DIM}Select a preset or choose custom to enter manual values${NC}"
-    echo ""
-    
-    # Fetch presets from API or local files
-    local presets_json=""
-    presets_json=$(curl -s --max-time 5 https://api.meshcore.nz/api/v1/config 2>/dev/null)
-    
-    if [ -z "$presets_json" ]; then
-        if [ -f "$CONSOLE_DIR/radio-presets.json" ]; then
-            presets_json=$(cat "$CONSOLE_DIR/radio-presets.json")
-        elif [ -f "$REPEATER_DIR/radio-presets.json" ]; then
-            presets_json=$(cat "$REPEATER_DIR/radio-presets.json")
-        fi
-    fi
-    
-    local preset_count=0
-    local preset_titles=()
-    local preset_freqs=()
-    local preset_sfs=()
-    local preset_bws=()
-    local preset_crs=()
-    
-    if [ -n "$presets_json" ]; then
-        while IFS= read -r line; do
-            local title=$(echo "$line" | jq -r '.title')
-            local freq=$(echo "$line" | jq -r '.frequency')
-            local sf=$(echo "$line" | jq -r '.spreading_factor')
-            local bw=$(echo "$line" | jq -r '.bandwidth')
-            local cr=$(echo "$line" | jq -r '.coding_rate')
-            
-            if [ -n "$title" ] && [ "$title" != "null" ]; then
-                ((preset_count++)) || true
-                preset_titles+=("$title")
-                preset_freqs+=("$freq")
-                preset_sfs+=("$sf")
-                preset_bws+=("$bw")
-                preset_crs+=("$cr")
-                echo -e "  ${CYAN}$preset_count)${NC} $title ${DIM}(${freq}MHz SF$sf BW${bw}kHz)${NC}"
-            fi
-        done < <(echo "$presets_json" | jq -c '.[]' 2>/dev/null)
-    fi
-    
-    # If no presets loaded, show fallback options with descriptions
-    if [ $preset_count -eq 0 ]; then
-        echo -e "  ${YELLOW}Could not fetch presets from API. Showing common options:${NC}"
-        echo ""
-        # Fallback presets - matches upstream api.meshcore.nz/api/v1/config + WestCoastMesh
-        preset_titles=("USA/Canada (Recommended)" "Australia" "EU/UK (Long Range)" "EU/UK (Narrow)" "New Zealand" "New Zealand (Narrow)" "WestCoastMesh US")
-        preset_freqs=("910.525" "915.800" "869.525" "869.618" "917.375" "917.375" "927.875")
-        preset_sfs=("7" "10" "11" "8" "11" "7" "7")
-        preset_bws=("62.5" "250" "250" "62.5" "250" "62.5" "62.5")
-        preset_crs=("5" "5" "5" "8" "5" "5" "5")
-        preset_count=${#preset_titles[@]}
-        
-        echo -e "  ${CYAN}1)${NC} USA/Canada        ${DIM}(910.525MHz SF7 BW62.5kHz CR5 - Recommended)${NC}"
-        echo -e "  ${CYAN}2)${NC} Australia         ${DIM}(915.800MHz SF10 BW250kHz CR5)${NC}"
-        echo -e "  ${CYAN}3)${NC} EU/UK Long Range  ${DIM}(869.525MHz SF11 BW250kHz CR5)${NC}"
-        echo -e "  ${CYAN}4)${NC} EU/UK Narrow      ${DIM}(869.618MHz SF8 BW62.5kHz CR8)${NC}"
-        echo -e "  ${CYAN}5)${NC} New Zealand       ${DIM}(917.375MHz SF11 BW250kHz CR5)${NC}"
-        echo -e "  ${CYAN}6)${NC} New Zealand Narrow ${DIM}(917.375MHz SF7 BW62.5kHz CR5)${NC}"
-        echo -e "  ${CYAN}7)${NC} WestCoastMesh US  ${DIM}(927.875MHz SF7 BW62.5kHz CR5 - SoCal optimized)${NC}"
-    fi
-    
-    echo -e "  ${CYAN}C)${NC} Custom ${DIM}(enter values manually)${NC}"
-    echo ""
-    
-    read -p "  Select preset [1-$preset_count] or C for custom: " preset_choice
-    
-    local freq_mhz bw_khz sf cr
-    
-    if [[ "$preset_choice" =~ ^[Cc]$ ]]; then
-        # Custom values
-        echo ""
-        echo -e "  ${BOLD}Custom Radio Settings${NC}"
-        
-        local current_freq=$(yq '.radio.frequency' "$config_file" 2>/dev/null || echo "869618000")
-        local current_freq_mhz=$(awk "BEGIN {printf \"%.3f\", $current_freq / 1000000}")
-        read -p "  Frequency in MHz [$current_freq_mhz]: " freq_mhz
-        freq_mhz=${freq_mhz:-$current_freq_mhz}
-        
-        local current_sf=$(yq '.radio.spreading_factor' "$config_file" 2>/dev/null || echo "8")
-        read -p "  Spreading Factor (7-12) [$current_sf]: " sf
-        sf=${sf:-$current_sf}
-        
-        local current_bw=$(yq '.radio.bandwidth' "$config_file" 2>/dev/null || echo "62500")
-        local current_bw_khz=$(awk "BEGIN {printf \"%.1f\", $current_bw / 1000}")
-        read -p "  Bandwidth in kHz [$current_bw_khz]: " bw_khz
-        bw_khz=${bw_khz:-$current_bw_khz}
-        
-        local current_cr=$(yq '.radio.coding_rate' "$config_file" 2>/dev/null || echo "8")
-        read -p "  Coding Rate (5-8) [$current_cr]: " cr
-        cr=${cr:-$current_cr}
-        
-        # Apply custom settings
-        local freq_hz=$(awk "BEGIN {printf \"%.0f\", $freq_mhz * 1000000}")
-        local bw_hz=$(awk "BEGIN {printf \"%.0f\", $bw_khz * 1000}")
-        
-        yq -i ".radio.frequency = $freq_hz" "$config_file"
-        yq -i ".radio.spreading_factor = $sf" "$config_file"
-        yq -i ".radio.bandwidth = $bw_hz" "$config_file"
-        yq -i ".radio.coding_rate = $cr" "$config_file"
-        
-        echo ""
-        print_success "Radio: ${freq_mhz}MHz SF$sf BW${bw_khz}kHz CR$cr"
-    elif [[ "$preset_choice" =~ ^[0-9]+$ ]] && [ "$preset_choice" -ge 1 ] && [ "$preset_choice" -le "$preset_count" ]; then
-        # Use preset
-        local idx=$((preset_choice - 1))
-        freq_mhz="${preset_freqs[$idx]}"
-        sf="${preset_sfs[$idx]}"
-        bw_khz="${preset_bws[$idx]}"
-        cr="${preset_crs[$idx]}"
-        print_success "Using preset: ${preset_titles[$idx]}"
-        
-        # Apply settings
-        local freq_hz=$(awk "BEGIN {printf \"%.0f\", $freq_mhz * 1000000}")
-        local bw_hz=$(awk "BEGIN {printf \"%.0f\", $bw_khz * 1000}")
-        
-        yq -i ".radio.frequency = $freq_hz" "$config_file"
-        yq -i ".radio.spreading_factor = $sf" "$config_file"
-        yq -i ".radio.bandwidth = $bw_hz" "$config_file"
-        yq -i ".radio.coding_rate = $cr" "$config_file"
-        
-        echo ""
-        print_success "Radio: ${freq_mhz}MHz SF$sf BW${bw_khz}kHz CR$cr"
-    else
-        print_warning "Invalid selection, keeping current radio settings"
-    fi
-    
-    # Hardware selection (before TX power so user can override hardware default)
-    echo ""
-    echo -e "  ${BOLD}Hardware Selection${NC}"
-    echo -e "  ${DIM}Select your LoRa hardware for GPIO configuration${NC}"
-    echo ""
-    
-    configure_hardware_terminal "$config_file"
-    
-    # TX Power (after hardware selection so user's choice takes precedence)
-    echo -e "  ${BOLD}TX Power${NC}"
-    local current_power=$(yq '.radio.tx_power' "$config_file" 2>/dev/null || echo "22")
-    read -p "  TX Power in dBm [$current_power]: " tx_power
-    tx_power=${tx_power:-$current_power}
-    yq -i ".radio.tx_power = $tx_power" "$config_file"
-    print_success "TX Power: ${tx_power}dBm"
-    echo ""
-}
-
-# Terminal-based hardware/GPIO configuration
-configure_hardware_terminal() {
-    local config_file="${1:-$CONFIG_DIR/config.yaml}"
-    local hw_config=""
-    
-    # Find hardware presets file
-    if [ -f "$CONSOLE_DIR/radio-settings.json" ]; then
-        hw_config="$CONSOLE_DIR/radio-settings.json"
-    elif [ -f "$REPEATER_DIR/radio-settings.json" ]; then
-        hw_config="$REPEATER_DIR/radio-settings.json"
-    fi
-    
-    if [ -z "$hw_config" ] || [ ! -f "$hw_config" ]; then
-        print_warning "Hardware presets not found, skipping GPIO configuration"
-        print_info "Configure GPIO manually with: ./manage.sh gpio"
-        return 0
-    fi
-    
-    # Build hardware options
-    local hw_count=0
-    local hw_keys=()
-    local hw_names=()
-    
-    while IFS= read -r key; do
-        local name=$(jq -r ".hardware.\"$key\".name" "$hw_config" 2>/dev/null)
-        if [ -n "$name" ] && [ "$name" != "null" ]; then
-            ((hw_count++)) || true
-            hw_keys+=("$key")
-            hw_names+=("$name")
-            echo -e "  ${CYAN}$hw_count)${NC} $name"
-        fi
-    done < <(jq -r '.hardware | keys[]' "$hw_config" 2>/dev/null)
-    
-    echo -e "  ${CYAN}C)${NC} Custom GPIO ${DIM}(enter pins manually)${NC}"
-    echo ""
-    
-    read -p "  Select hardware [1-$hw_count] or C for custom: " hw_choice
-    
-    if [[ "$hw_choice" =~ ^[Cc]$ ]]; then
-        # Custom GPIO
-        echo ""
-        echo -e "  ${BOLD}Custom GPIO Configuration${NC} ${YELLOW}(BCM pin numbering)${NC}"
-        
-        local current_cs=$(yq '.sx1262.cs_pin' "$config_file" 2>/dev/null || echo "21")
-        read -p "  Chip Select pin [$current_cs]: " cs_pin
-        cs_pin=${cs_pin:-$current_cs}
-        
-        local current_reset=$(yq '.sx1262.reset_pin' "$config_file" 2>/dev/null || echo "18")
-        read -p "  Reset pin [$current_reset]: " reset_pin
-        reset_pin=${reset_pin:-$current_reset}
-        
-        local current_busy=$(yq '.sx1262.busy_pin' "$config_file" 2>/dev/null || echo "20")
-        read -p "  Busy pin [$current_busy]: " busy_pin
-        busy_pin=${busy_pin:-$current_busy}
-        
-        local current_irq=$(yq '.sx1262.irq_pin' "$config_file" 2>/dev/null || echo "16")
-        read -p "  IRQ pin [$current_irq]: " irq_pin
-        irq_pin=${irq_pin:-$current_irq}
-        
-        local current_txen=$(yq '.sx1262.txen_pin' "$config_file" 2>/dev/null || echo "-1")
-        read -p "  TX Enable pin (-1 to disable) [$current_txen]: " txen_pin
-        txen_pin=${txen_pin:-$current_txen}
-        
-        local current_rxen=$(yq '.sx1262.rxen_pin' "$config_file" 2>/dev/null || echo "-1")
-        read -p "  RX Enable pin (-1 to disable) [$current_rxen]: " rxen_pin
-        rxen_pin=${rxen_pin:-$current_rxen}
-        
-        # Apply custom GPIO
-        yq -i ".sx1262.cs_pin = $cs_pin" "$config_file"
-        yq -i ".sx1262.reset_pin = $reset_pin" "$config_file"
-        yq -i ".sx1262.busy_pin = $busy_pin" "$config_file"
-        yq -i ".sx1262.irq_pin = $irq_pin" "$config_file"
-        yq -i ".sx1262.txen_pin = $txen_pin" "$config_file"
-        yq -i ".sx1262.rxen_pin = $rxen_pin" "$config_file"
-        
-        echo ""
-        print_success "Custom GPIO: CS=$cs_pin RST=$reset_pin BUSY=$busy_pin IRQ=$irq_pin"
-        
-    elif [[ "$hw_choice" =~ ^[0-9]+$ ]] && [ "$hw_choice" -ge 1 ] && [ "$hw_choice" -le "$hw_count" ]; then
-        # Use preset
-        local idx=$((hw_choice - 1))
-        local hw_key="${hw_keys[$idx]}"
-        local hw_name="${hw_names[$idx]}"
-        local preset=$(jq ".hardware.\"$hw_key\"" "$hw_config" 2>/dev/null)
-        
-        if [ -n "$preset" ] && [ "$preset" != "null" ]; then
-            # Extract all GPIO settings
-            local bus_id=$(echo "$preset" | jq -r '.bus_id // 0')
-            local cs_id=$(echo "$preset" | jq -r '.cs_id // 0')
-            local cs_pin=$(echo "$preset" | jq -r '.cs_pin // 21')
-            local reset_pin=$(echo "$preset" | jq -r '.reset_pin // 18')
-            local busy_pin=$(echo "$preset" | jq -r '.busy_pin // 20')
-            local irq_pin=$(echo "$preset" | jq -r '.irq_pin // 16')
-            local txen_pin=$(echo "$preset" | jq -r '.txen_pin // -1')
-            local rxen_pin=$(echo "$preset" | jq -r '.rxen_pin // -1')
-            local is_waveshare=$(echo "$preset" | jq -r '.is_waveshare // false')
-            local use_dio3_tcxo=$(echo "$preset" | jq -r '.use_dio3_tcxo // false')
-            local tx_power=$(echo "$preset" | jq -r '.tx_power // 22')
-            local preamble_length=$(echo "$preset" | jq -r '.preamble_length // 17')
-            
-            # Apply to config
-            yq -i ".sx1262.bus_id = $bus_id" "$config_file"
-            yq -i ".sx1262.cs_id = $cs_id" "$config_file"
-            yq -i ".sx1262.cs_pin = $cs_pin" "$config_file"
-            yq -i ".sx1262.reset_pin = $reset_pin" "$config_file"
-            yq -i ".sx1262.busy_pin = $busy_pin" "$config_file"
-            yq -i ".sx1262.irq_pin = $irq_pin" "$config_file"
-            yq -i ".sx1262.txen_pin = $txen_pin" "$config_file"
-            yq -i ".sx1262.rxen_pin = $rxen_pin" "$config_file"
-            yq -i ".sx1262.is_waveshare = $is_waveshare" "$config_file"
-            yq -i ".sx1262.use_dio3_tcxo = $use_dio3_tcxo" "$config_file"
-            # Note: tx_power is set as default but user can override in next step
-            yq -i ".radio.tx_power = $tx_power" "$config_file"
-            yq -i ".radio.preamble_length = $preamble_length" "$config_file"
-            
-            echo ""
-            print_success "Hardware: $hw_name"
-            print_success "GPIO: CS=$cs_pin RST=$reset_pin BUSY=$busy_pin IRQ=$irq_pin"
-            if [ "$txen_pin" != "-1" ]; then
-                print_info "TX/RX Enable: TXEN=$txen_pin RXEN=$rxen_pin"
-            fi
-            print_info "Default TX Power: ${tx_power}dBm (you can change this next)"
-        fi
-    else
-        print_warning "Invalid selection, keeping current GPIO settings"
-        print_info "Configure GPIO later with: ./manage.sh gpio"
-    fi
-    
-    echo ""
-}
-
-# ============================================================================
-# Settings Function (Radio Configuration) - TUI version for manage.sh menu
-# ============================================================================
-
-do_settings() {
-    if [ ! -f "$CONFIG_DIR/config.yaml" ]; then
-        show_error "Configuration file not found!\n\nPlease install pyMC Console first."
-        return 1
-    fi
-    
-    while true; do
-        local current_name=$(yq '.repeater.node_name' "$CONFIG_DIR/config.yaml" 2>/dev/null || echo "unknown")
-        local current_freq=$(yq '.radio.frequency' "$CONFIG_DIR/config.yaml" 2>/dev/null || echo "0")
-        local current_freq_mhz=$(awk "BEGIN {printf \"%.3f\", $current_freq / 1000000}")
-        local current_sf=$(yq '.radio.spreading_factor' "$CONFIG_DIR/config.yaml" 2>/dev/null || echo "0")
-        local current_bw=$(yq '.radio.bandwidth' "$CONFIG_DIR/config.yaml" 2>/dev/null || echo "0")
-        local current_bw_khz=$(awk "BEGIN {printf \"%.1f\", $current_bw / 1000}")
-        local current_power=$(yq '.radio.tx_power' "$CONFIG_DIR/config.yaml" 2>/dev/null || echo "0")
-        
-        CHOICE=$($DIALOG --backtitle "pyMC Console Management" --title "Radio Settings" --menu "\nCurrent Configuration:\n  Name: $current_name\n  Freq: ${current_freq_mhz}MHz | SF$current_sf | BW${current_bw_khz}kHz | ${current_power}dBm\n\nSelect setting to change:" 20 70 8 \
-            "name" "Node name ($current_name)" \
-            "preset" "Load radio preset (frequency, SF, BW, CR)" \
-            "frequency" "Frequency (${current_freq_mhz}MHz)" \
-            "power" "TX Power (${current_power}dBm)" \
-            "spreading" "Spreading Factor (SF$current_sf)" \
-            "bandwidth" "Bandwidth (${current_bw_khz}kHz)" \
-            "apply" "Apply changes and restart" \
-            "back" "Back to main menu" 3>&1 1>&2 2>&3)
-        
-        case $CHOICE in
-            "name")
-                local new_name=$(get_input "Node Name" "Enter repeater node name:" "$current_name")
-                if [ -n "$new_name" ]; then
-                    yq -i ".repeater.node_name = \"$new_name\"" "$CONFIG_DIR/config.yaml"
-                    show_info "Updated" "Node name set to: $new_name"
-                fi
-                ;;
-            "preset")
-                select_radio_preset
-                ;;
-            "frequency")
-                local new_freq=$(get_input "Frequency" "Enter frequency in MHz (e.g., 869.618):" "$current_freq_mhz")
-                if [ -n "$new_freq" ]; then
-                    local freq_hz=$(awk "BEGIN {printf \"%.0f\", $new_freq * 1000000}")
-                    yq -i ".radio.frequency = $freq_hz" "$CONFIG_DIR/config.yaml"
-                    show_info "Updated" "Frequency set to: ${new_freq}MHz"
-                fi
-                ;;
-            "power")
-                local new_power=$(get_input "TX Power" "Enter TX power in dBm (e.g., 14):" "$current_power")
-                if [ -n "$new_power" ]; then
-                    yq -i ".radio.tx_power = $new_power" "$CONFIG_DIR/config.yaml"
-                    show_info "Updated" "TX Power set to: ${new_power}dBm"
-                fi
-                ;;
-            "spreading")
-                local new_sf=$(get_input "Spreading Factor" "Enter spreading factor (7-12):" "$current_sf")
-                if [ -n "$new_sf" ]; then
-                    yq -i ".radio.spreading_factor = $new_sf" "$CONFIG_DIR/config.yaml"
-                    show_info "Updated" "Spreading factor set to: SF$new_sf"
-                fi
-                ;;
-            "bandwidth")
-                local new_bw=$(get_input "Bandwidth" "Enter bandwidth in kHz (e.g., 62.5):" "$current_bw_khz")
-                if [ -n "$new_bw" ]; then
-                    local bw_hz=$(awk "BEGIN {printf \"%.0f\", $new_bw * 1000}")
-                    yq -i ".radio.bandwidth = $bw_hz" "$CONFIG_DIR/config.yaml"
-                    show_info "Updated" "Bandwidth set to: ${new_bw}kHz"
-                fi
-                ;;
-            "apply")
-                if [ "$EUID" -eq 0 ]; then
-                    systemctl restart "$BACKEND_SERVICE" 2>/dev/null || true
-                    sleep 2
-                    if backend_running; then
-                        show_info "Applied" "Configuration applied and service restarted successfully!"
-                    else
-                        show_error "Service failed to restart!\n\nCheck logs: journalctl -u $BACKEND_SERVICE"
-                    fi
-                else
-                    show_info "Note" "Run as root to restart services automatically.\n\nManually restart with:\nsudo systemctl restart $BACKEND_SERVICE"
-                fi
-                ;;
-            "back"|"")
-                return 0
-                ;;
-        esac
-    done
-}
-
-select_radio_preset() {
-    # Fetch presets from API or use local file
-    local presets_json=""
-    
-    echo "Fetching radio presets..." >&2
-    presets_json=$(curl -s --max-time 5 https://api.meshcore.nz/api/v1/config 2>/dev/null)
-    
-    if [ -z "$presets_json" ]; then
-        if [ -f "$CONSOLE_DIR/radio-presets.json" ]; then
-            presets_json=$(cat "$CONSOLE_DIR/radio-presets.json")
-        elif [ -f "$REPEATER_DIR/radio-presets.json" ]; then
-            presets_json=$(cat "$REPEATER_DIR/radio-presets.json")
-        else
-            show_error "Could not fetch radio presets from API and no local file found."
-            return 1
-        fi
-    fi
-    
-    # Build menu from presets
-    local menu_items=()
-    local index=1
-    
-    while IFS= read -r line; do
-        local title=$(echo "$line" | jq -r '.title')
-        local freq=$(echo "$line" | jq -r '.frequency')
-        local sf=$(echo "$line" | jq -r '.spreading_factor')
-        local bw=$(echo "$line" | jq -r '.bandwidth')
-        menu_items+=("$index" "$title (${freq}MHz SF$sf BW$bw)")
-        ((index++)) || true
-    done < <(echo "$presets_json" | jq -c '.[]' 2>/dev/null)
-    
-    if [ ${#menu_items[@]} -eq 0 ]; then
-        show_error "No presets found in configuration."
-        return 1
-    fi
-    
-    local selection=$($DIALOG --backtitle "pyMC Console Management" --title "Radio Presets" --menu "Select a radio preset:" 20 70 10 "${menu_items[@]}" 3>&1 1>&2 2>&3)
-    
-    if [ -n "$selection" ]; then
-        local preset=$(echo "$presets_json" | jq -c ".[$((selection-1))]" 2>/dev/null)
-        
-        if [ -n "$preset" ] && [ "$preset" != "null" ]; then
-            local freq=$(echo "$preset" | jq -r '.frequency')
-            local sf=$(echo "$preset" | jq -r '.spreading_factor')
-            local bw=$(echo "$preset" | jq -r '.bandwidth')
-            local cr=$(echo "$preset" | jq -r '.coding_rate')
-            local title=$(echo "$preset" | jq -r '.title')
-            
-            local freq_hz=$(awk "BEGIN {printf \"%.0f\", $freq * 1000000}")
-            local bw_hz=$(awk "BEGIN {printf \"%.0f\", $bw * 1000}")
-            
-            yq -i ".radio.frequency = $freq_hz" "$CONFIG_DIR/config.yaml"
-            yq -i ".radio.spreading_factor = $sf" "$CONFIG_DIR/config.yaml"
-            yq -i ".radio.bandwidth = $bw_hz" "$CONFIG_DIR/config.yaml"
-            yq -i ".radio.coding_rate = $cr" "$CONFIG_DIR/config.yaml"
-            
-            show_info "Preset Applied" "Applied preset: $title\n\nFrequency: ${freq}MHz\nSpreading Factor: SF$sf\nBandwidth: ${bw}kHz\nCoding Rate: $cr\n\nRemember to apply changes to restart the service."
-        fi
-    fi
-}
-
-# ============================================================================
-# GPIO Function (Advanced Hardware Configuration)
-# ============================================================================
-
-do_gpio() {
-    # Show warning first
-    if ! ask_yes_no "⚠️  Advanced Configuration" "\nWARNING: GPIO Configuration\n\nThese settings are for ADVANCED USERS ONLY.\n\nIncorrect GPIO settings can:\n- Prevent radio communication\n- Cause hardware damage\n- Make the repeater non-functional\n\nOnly proceed if you know your hardware pinout!\n\nContinue?"; then
-        return 0
-    fi
-    
-    if [ ! -f "$CONFIG_DIR/config.yaml" ]; then
-        show_error "Configuration file not found!\n\nPlease install pyMC Console first."
-        return 1
-    fi
-    
-    while true; do
-        # Read current GPIO settings
-        local cs_pin=$(yq '.sx1262.cs_pin' "$CONFIG_DIR/config.yaml" 2>/dev/null || echo "-1")
-        local reset_pin=$(yq '.sx1262.reset_pin' "$CONFIG_DIR/config.yaml" 2>/dev/null || echo "-1")
-        local busy_pin=$(yq '.sx1262.busy_pin' "$CONFIG_DIR/config.yaml" 2>/dev/null || echo "-1")
-        local irq_pin=$(yq '.sx1262.irq_pin' "$CONFIG_DIR/config.yaml" 2>/dev/null || echo "-1")
-        local txen_pin=$(yq '.sx1262.txen_pin' "$CONFIG_DIR/config.yaml" 2>/dev/null || echo "-1")
-        local rxen_pin=$(yq '.sx1262.rxen_pin' "$CONFIG_DIR/config.yaml" 2>/dev/null || echo "-1")
-        
-        CHOICE=$($DIALOG --backtitle "pyMC Console Management" --title "GPIO Configuration ⚠️" --menu "\nCurrent GPIO Pins (BCM numbering):\n  CS: $cs_pin | Reset: $reset_pin | Busy: $busy_pin\n  IRQ: $irq_pin | TXEN: $txen_pin | RXEN: $rxen_pin\n\nSelect option:" 20 70 8 \
-            "preset" "Load hardware preset" \
-            "cs" "Chip Select pin ($cs_pin)" \
-            "reset" "Reset pin ($reset_pin)" \
-            "busy" "Busy pin ($busy_pin)" \
-            "irq" "IRQ pin ($irq_pin)" \
-            "txen" "TX Enable pin ($txen_pin, -1=disabled)" \
-            "rxen" "RX Enable pin ($rxen_pin, -1=disabled)" \
-            "apply" "Apply changes and restart" \
-            "back" "Back to main menu" 3>&1 1>&2 2>&3)
-        
-        case $CHOICE in
-            "preset")
-                select_hardware_preset
-                ;;
-            "cs")
-                local new_pin=$(get_input "Chip Select Pin" "Enter CS pin (BCM numbering):" "$cs_pin")
-                [ -n "$new_pin" ] && yq -i ".sx1262.cs_pin = $new_pin" "$CONFIG_DIR/config.yaml"
-                ;;
-            "reset")
-                local new_pin=$(get_input "Reset Pin" "Enter Reset pin (BCM numbering):" "$reset_pin")
-                [ -n "$new_pin" ] && yq -i ".sx1262.reset_pin = $new_pin" "$CONFIG_DIR/config.yaml"
-                ;;
-            "busy")
-                local new_pin=$(get_input "Busy Pin" "Enter Busy pin (BCM numbering):" "$busy_pin")
-                [ -n "$new_pin" ] && yq -i ".sx1262.busy_pin = $new_pin" "$CONFIG_DIR/config.yaml"
-                ;;
-            "irq")
-                local new_pin=$(get_input "IRQ Pin" "Enter IRQ pin (BCM numbering):" "$irq_pin")
-                [ -n "$new_pin" ] && yq -i ".sx1262.irq_pin = $new_pin" "$CONFIG_DIR/config.yaml"
-                ;;
-            "txen")
-                local new_pin=$(get_input "TX Enable Pin" "Enter TXEN pin (-1 to disable):" "$txen_pin")
-                [ -n "$new_pin" ] && yq -i ".sx1262.txen_pin = $new_pin" "$CONFIG_DIR/config.yaml"
-                ;;
-            "rxen")
-                local new_pin=$(get_input "RX Enable Pin" "Enter RXEN pin (-1 to disable):" "$rxen_pin")
-                [ -n "$new_pin" ] && yq -i ".sx1262.rxen_pin = $new_pin" "$CONFIG_DIR/config.yaml"
-                ;;
-            "apply")
-                if [ "$EUID" -eq 0 ]; then
-                    systemctl restart "$BACKEND_SERVICE" 2>/dev/null || true
-                    sleep 2
-                    if backend_running; then
-                        show_info "Applied" "GPIO configuration applied and service restarted!"
-                    else
-                        show_error "Service failed to restart!\n\nGPIO settings may be incorrect.\nCheck logs: journalctl -u $BACKEND_SERVICE"
-                    fi
-                else
-                    show_info "Note" "Run as root to restart services automatically."
-                fi
-                ;;
-            "back"|"")
-                return 0
-                ;;
-        esac
-    done
-}
-
-select_hardware_preset() {
-    local hw_config=""
-    
-    if [ -f "$CONSOLE_DIR/radio-settings.json" ]; then
-        hw_config="$CONSOLE_DIR/radio-settings.json"
-    elif [ -f "$REPEATER_DIR/radio-settings.json" ]; then
-        hw_config="$REPEATER_DIR/radio-settings.json"
-    else
-        show_error "Hardware configuration file not found!"
-        return 1
-    fi
-    
-    # Build menu from hardware presets
-    local menu_items=()
-    
-    # Use keys_unsorted to preserve JSON insertion order (matches upstream grep-based parsing)
-    while IFS= read -r key; do
-        local name=$(jq -r ".hardware.\"$key\".name" "$hw_config")
-        menu_items+=("$key" "$name")
-    done < <(jq -r '.hardware | keys_unsorted[]' "$hw_config" 2>/dev/null)
-    
-    if [ ${#menu_items[@]} -eq 0 ]; then
-        show_error "No hardware presets found."
-        return 1
-    fi
-    
-    local selection=$($DIALOG --backtitle "pyMC Console Management" --title "Hardware Presets" --menu "Select your hardware:" 20 70 10 "${menu_items[@]}" 3>&1 1>&2 2>&3)
-    
-    if [ -n "$selection" ]; then
-        local preset=$(jq ".hardware.\"$selection\"" "$hw_config" 2>/dev/null)
-        
-        if [ -n "$preset" ] && [ "$preset" != "null" ]; then
-            # Apply all GPIO settings from preset
-            local bus_id=$(echo "$preset" | jq -r '.bus_id // 0')
-            local cs_id=$(echo "$preset" | jq -r '.cs_id // 0')
-            local cs_pin=$(echo "$preset" | jq -r '.cs_pin // 21')
-            local reset_pin=$(echo "$preset" | jq -r '.reset_pin // 18')
-            local busy_pin=$(echo "$preset" | jq -r '.busy_pin // 20')
-            local irq_pin=$(echo "$preset" | jq -r '.irq_pin // 16')
-            local txen_pin=$(echo "$preset" | jq -r '.txen_pin // -1')
-            local rxen_pin=$(echo "$preset" | jq -r '.rxen_pin // -1')
-            local is_waveshare=$(echo "$preset" | jq -r '.is_waveshare // false')
-            local use_dio3_tcxo=$(echo "$preset" | jq -r '.use_dio3_tcxo // false')
-            local tx_power=$(echo "$preset" | jq -r '.tx_power // 14')
-            
-            yq -i ".sx1262.bus_id = $bus_id" "$CONFIG_DIR/config.yaml"
-            yq -i ".sx1262.cs_id = $cs_id" "$CONFIG_DIR/config.yaml"
-            yq -i ".sx1262.cs_pin = $cs_pin" "$CONFIG_DIR/config.yaml"
-            yq -i ".sx1262.reset_pin = $reset_pin" "$CONFIG_DIR/config.yaml"
-            yq -i ".sx1262.busy_pin = $busy_pin" "$CONFIG_DIR/config.yaml"
-            yq -i ".sx1262.irq_pin = $irq_pin" "$CONFIG_DIR/config.yaml"
-            yq -i ".sx1262.txen_pin = $txen_pin" "$CONFIG_DIR/config.yaml"
-            yq -i ".sx1262.rxen_pin = $rxen_pin" "$CONFIG_DIR/config.yaml"
-            yq -i ".sx1262.is_waveshare = $is_waveshare" "$CONFIG_DIR/config.yaml"
-            yq -i ".sx1262.use_dio3_tcxo = $use_dio3_tcxo" "$CONFIG_DIR/config.yaml"
-            yq -i ".radio.tx_power = $tx_power" "$CONFIG_DIR/config.yaml"
-            
-            local name=$(echo "$preset" | jq -r '.name')
-            show_info "Preset Applied" "Applied hardware preset: $name\n\nGPIO Pins:\n  CS: $cs_pin | Reset: $reset_pin\n  Busy: $busy_pin | IRQ: $irq_pin\n  TXEN: $txen_pin | RXEN: $rxen_pin\n\nTX Power: ${tx_power}dBm\n\nRemember to apply changes to restart."
-        fi
-    fi
-}
-
-# ============================================================================
-# Service Control Functions
-# ============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# Service Control (simple wrappers)
+# ─────────────────────────────────────────────────────────────────────────────
 
 do_start() {
-    if [ "$EUID" -ne 0 ]; then
-        show_error "Service control requires root privileges.\n\nPlease run: sudo $0 start"
-        return 1
-    fi
-    
-    echo "Starting service..."
-    systemctl start "$BACKEND_SERVICE" 2>/dev/null || true
-    sleep 2
-    
-    local status="✗"
-    backend_running && status="✓"
-    
-    show_info "Service Started" "\npyMC Repeater: $status\n\nDashboard: http://$(hostname -I | awk '{print $1}'):8000/"
+    [[ "$EUID" -ne 0 ]] && { echo "Run as root: sudo $0 start"; return 1; }
+    systemctl start "$SERVICE_NAME"
+    sleep 1
+    service_running && echo "✓ Service started" || echo "✗ Service failed to start"
 }
 
 do_stop() {
-    if [ "$EUID" -ne 0 ]; then
-        show_error "Service control requires root privileges.\n\nPlease run: sudo $0 stop"
-        return 1
-    fi
-    
-    echo "Stopping service..."
-    systemctl stop "$BACKEND_SERVICE" 2>/dev/null || true
-    
-    show_info "Service Stopped" "\n✓ pyMC Repeater service has been stopped."
+    [[ "$EUID" -ne 0 ]] && { echo "Run as root: sudo $0 stop"; return 1; }
+    systemctl stop "$SERVICE_NAME"
+    echo "✓ Service stopped"
 }
 
 do_restart() {
-    if [ "$EUID" -ne 0 ]; then
-        show_error "Service control requires root privileges.\n\nPlease run: sudo $0 restart"
-        return 1
-    fi
-    
-    echo "Restarting service..."
-    systemctl restart "$BACKEND_SERVICE" 2>/dev/null || true
-    sleep 2
-    
-    local status="✗"
-    backend_running && status="✓"
-    
-    show_info "Service Restarted" "\npyMC Repeater: $status\n\nDashboard: http://$(hostname -I | awk '{print $1}'):8000/"
+    [[ "$EUID" -ne 0 ]] && { echo "Run as root: sudo $0 restart"; return 1; }
+    systemctl restart "$SERVICE_NAME"
+    sleep 1
+    service_running && echo "✓ Service restarted" || echo "✗ Service failed to start"
 }
 
-# ============================================================================
-# Uninstall Function
-# ============================================================================
-
-do_uninstall() {
-    # Get site-packages path for checking leftovers
-    local site_packages
-    site_packages=$(python3 -c "import site; print(site.getsitepackages()[0])" 2>/dev/null || echo "/usr/local/lib/python3/dist-packages")
-    
-    # Check for ANY installation (old paths, new paths, or site-packages leftovers)
-    local found_install=false
-    [ -d "$INSTALL_DIR" ] && found_install=true
-    [ -d "$CONSOLE_DIR" ] && found_install=true
-    [ -d "/opt/pymc_console/pymc_repeater" ] && found_install=true  # Old path
-    [ -f "/etc/systemd/system/pymc-repeater.service" ] && found_install=true
-    [ -d "$site_packages/repeater" ] && found_install=true  # pip leftovers
-    [ -d "$site_packages/pymc_core" ] && found_install=true  # pip leftovers
-    
-    if [ "$found_install" = false ]; then
-        show_error "pyMC Console is not installed."
-        return 1
-    fi
-    
-    if [ "$EUID" -ne 0 ]; then
-        show_error "Uninstall requires root privileges.\n\nPlease run: sudo $0 uninstall"
-        return 1
-    fi
-    
-    # Check if clone directory exists
-    local has_clone=false
-    [ -d "$CLONE_DIR" ] && has_clone=true
-    
-    local uninstall_msg="\nThis will COMPLETELY REMOVE:\n\n- pyMC Repeater service and files\n- pyMC Console frontend\n- Python packages (pymc_repeater, pymc_core)\n- Configuration files\n- Log files\n- Service user"
-    
-    if [ "$has_clone" = true ]; then
-        uninstall_msg="$uninstall_msg\n\nNote: The clone at $CLONE_DIR will be kept.\nYou can remove it manually if desired."
-    fi
-    
-    uninstall_msg="$uninstall_msg\n\nThis action cannot be undone!\n\nContinue?"
-    
-    if ! ask_yes_no "⚠️  Confirm Uninstall" "$uninstall_msg"; then
-        return 0
-    fi
-    
-    clear
-    echo "=== pyMC Console Uninstall ==="
-    echo ""
-    
-    # =========================================================================
-    # Step 1: Run upstream uninstaller (simple - no fancy progress bar needed)
-    # =========================================================================
-    echo "[1/4] Removing pyMC_Repeater..."
-    
-    # Always do manual cleanup - it's fast and reliable
-    # (upstream's uninstaller uses TUI which is complex to wrap)
-    systemctl stop "$BACKEND_SERVICE" 2>/dev/null || true
-    systemctl disable "$BACKEND_SERVICE" 2>/dev/null || true
-    rm -f /etc/systemd/system/pymc-repeater.service
-    systemctl daemon-reload
-    rm -rf "$INSTALL_DIR"
-    rm -rf "$CONFIG_DIR"
-    rm -rf "$LOG_DIR"
-    rm -rf /var/lib/pymc_repeater
-    if id "$SERVICE_USER" &>/dev/null; then
-        userdel "$SERVICE_USER" 2>/dev/null || true
-    fi
-    echo "    ✓ pyMC_Repeater removed"
-    
-    # =========================================================================
-    # Step 2: Remove pyMC Console extras (not handled by upstream)
-    # =========================================================================
-    echo "[2/4] Removing pyMC Console extras..."
-    rm -rf "$CONSOLE_DIR"
-    rm -rf "/opt/pymc_console"  # Old path
-    echo "    ✓ Console directories removed"
-    
-    # =========================================================================
-    # Step 3: Clean up any leftover site-packages (pip leftovers)
-    # =========================================================================
-    echo "[3/4] Cleaning up Python packages..."
-    pip uninstall -y pymc_repeater 2>/dev/null || true
-    pip uninstall -y pymc_core 2>/dev/null || true
-    pip uninstall -y pymc-repeater 2>/dev/null || true
-    pip uninstall -y pymc-core 2>/dev/null || true
-    # Remove any leftover directories
-    rm -rf "$site_packages/repeater" 2>/dev/null || true
-    rm -rf "$site_packages/pymc_core" 2>/dev/null || true
-    rm -rf "$site_packages/pymc_repeater"* 2>/dev/null || true
-    rm -rf "$site_packages/pymc_core"* 2>/dev/null || true
-    echo "    ✓ Python packages cleaned"
-    
-    # =========================================================================
-    # Step 4: Handle clone directory
-    # =========================================================================
-    echo "[4/4] Finalizing..."
-    
-    echo ""
-    echo "=== Uninstall Complete ==="
-    echo ""
-    
-    # Offer to delete clone directory
-    if [ "$has_clone" = true ]; then
-        if ask_yes_no "Remove Clone?" "\nThe pyMC_Repeater clone still exists at:\n$CLONE_DIR\n\nWould you like to remove it as well?"; then
-            rm -rf "$CLONE_DIR"
-            echo "    ✓ Clone directory removed"
-        else
-            echo "    Clone directory preserved at: $CLONE_DIR"
-        fi
-        echo ""
-    fi
-    
-    show_info "Uninstall Complete" "\npyMC Console has been completely removed.\n\nThank you for using pyMC Console!"
-}
-
-# ============================================================================
-# Helper Functions
-# ============================================================================
-
-check_spi() {
-    # Skip SPI check on non-Linux systems (macOS, etc.)
-    if [[ "$(uname -s)" != "Linux" ]]; then
-        return 0
-    fi
-    
-    # Check if SPI is already loaded via kernel module
-    if grep -q "spi" /proc/modules 2>/dev/null; then
-        return 0
-    fi
-    
-    # Check for spidev devices (works on Ubuntu and other distros)
-    if ls /dev/spidev* &>/dev/null; then
-        return 0
-    fi
-    
-    # Check if spi_bcm2835 or spi_bcm2708 modules are available (Raspberry Pi)
-    if lsmod 2>/dev/null | grep -q "spi_bcm"; then
-        return 0
-    fi
-    
-    # Check if spidev module is loaded
-    if lsmod 2>/dev/null | grep -q "spidev"; then
-        return 0
-    fi
-    
-    # Raspberry Pi / Ubuntu on Pi: check config.txt locations
-    local config_file=""
-    if [ -f "/boot/firmware/config.txt" ]; then
-        # Ubuntu on Raspberry Pi uses /boot/firmware/
-        config_file="/boot/firmware/config.txt"
-    elif [ -f "/boot/config.txt" ]; then
-        # Raspberry Pi OS uses /boot/
-        config_file="/boot/config.txt"
-    fi
-    
-    if [ -n "$config_file" ]; then
-        # Raspberry Pi (any OS) - can enable via config.txt
-        if grep -q "dtparam=spi=on" "$config_file" 2>/dev/null; then
-            return 0
-        fi
-        
-        if ask_yes_no "SPI Not Enabled" "\nSPI interface is required but not enabled!\n\nWould you like to enable it now?\n(This will require a reboot)"; then
-            echo "dtparam=spi=on" >> "$config_file"
-            show_info "SPI Enabled" "\nSPI has been enabled.\n\nSystem will reboot now.\nPlease run this script again after reboot."
-            reboot
-        else
-            show_error "SPI is required for LoRa radio operation.\n\nPlease enable SPI manually and run this script again."
-            exit 1
-        fi
+do_status() {
+    if is_installed; then
+        echo "pyMC_Repeater: $(get_version)"
+        echo "Console:       v$(get_console_version)"
+        echo "Service:       $(service_running && echo "running" || echo "stopped")"
     else
-        # Generic Linux (Ubuntu x86, other SBCs, etc.)
-        # Try to load spidev module
-        if modprobe spidev 2>/dev/null; then
-            if ls /dev/spidev* &>/dev/null; then
-                return 0
-            fi
-        fi
-        
-        # Still no SPI - warn user
-        if ! ask_yes_no "SPI Check" "\nCould not verify SPI is enabled.\n\nFor LoRa radio operation, ensure SPI is enabled on your system.\n\nOn Ubuntu/Debian, you may need to:\n- Load the spidev module: sudo modprobe spidev\n- Enable SPI in device tree overlays\n- Check your hardware supports SPI\n\nContinue anyway?"; then
-            exit 1
-        fi
+        echo "Not installed"
     fi
 }
 
-install_yq() {
-    if ! command -v yq &> /dev/null || [[ "$(yq --version 2>&1)" != *"mikefarah/yq"* ]]; then
-        echo "Installing yq..."
-        install_yq_silent
-    fi
-}
-
-# Silent version for use with spinner
-install_yq_silent() {
-    local YQ_VERSION="v4.40.5"
-    local YQ_BINARY="yq_linux_arm64"
-    
-    if [[ "$(uname -m)" == "x86_64" ]]; then
-        YQ_BINARY="yq_linux_amd64"
-    elif [[ "$(uname -m)" == "armv7"* ]]; then
-        YQ_BINARY="yq_linux_arm"
-    elif [[ "$(uname -s)" == "Darwin" ]]; then
-        YQ_BINARY="yq_darwin_arm64"
-        [[ "$(uname -m)" == "x86_64" ]] && YQ_BINARY="yq_darwin_amd64"
-    fi
-    
-    wget -qO /usr/local/bin/yq "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/${YQ_BINARY}" && chmod +x /usr/local/bin/yq
-}
-
-# ============================================================================
-# UPSTREAM INSTALLATION MANAGER
-# ============================================================================
-# This section handles running pyMC_Repeater's native manage.sh installer.
-# We run upstream's installer directly (user sees their native TUI), then
-# apply our patches and overlay our dashboard afterward.
-#
-# The approach:
-# 1. Clone/update pyMC_Repeater to a sibling directory
-# 2. Run upstream's manage.sh (install/upgrade) in foreground - user sees TUI
-# 3. Apply our patches to the installed files (/opt/pymc_repeater)
-# 4. Overlay our React dashboard
-# 5. Run our radio configuration
-#
-# Note: Upstream's radio config script is temporarily renamed during install
-# so we can run our own configuration flow instead.
-# ============================================================================
-
-# Run upstream's manage.sh with a specific action
-# Usage: run_upstream_installer <action> [branch]
-# Actions: install, upgrade
-#
-# Strategy: Let upstream run in foreground so user sees its native TUI.
-# We skip upstream's radio config and do our own after.
-run_upstream_installer() {
-    local action="$1"
-    local branch="${2:-$DEFAULT_BRANCH}"
-    local upstream_script="$CLONE_DIR/manage.sh"
-    local exit_code=0
-    
-    # Verify clone exists
-    if [ ! -f "$upstream_script" ]; then
-        print_error "Upstream manage.sh not found at $upstream_script"
-        return 1
-    fi
-    
-    # Temporarily rename setup-radio-config.sh to skip upstream's radio config
-    # We run our own config after installation
-    local radio_config_script="$CLONE_DIR/setup-radio-config.sh"
-    local radio_config_backup=""
-    if [ -f "$radio_config_script" ]; then
-        radio_config_backup="${radio_config_script}.pymc_backup"
-        mv "$radio_config_script" "$radio_config_backup"
-    fi
-    
-    echo ""
-    echo -e "        ${DIM}────────────────────────────────────────────────────────${NC}"
-    echo -e "        ${BOLD}Running pyMC_Repeater $action...${NC}"
-    echo -e "        ${DIM}You'll see the upstream installer's interface below.${NC}"
-    echo -e "        ${DIM}────────────────────────────────────────────────────────${NC}"
-    echo ""
-    
-    # Run upstream's manage.sh directly in foreground
-    # User sees the native TUI (whiptail dialogs, progress bars, etc.)
-    (
-        cd "$CLONE_DIR"
-        bash "$upstream_script" "$action"
-    )
-    exit_code=$?
-    
-    echo ""
-    echo -e "        ${DIM}────────────────────────────────────────────────────────${NC}"
-    
-    # Restore radio config script if we backed it up
-    if [ -n "$radio_config_backup" ] && [ -f "$radio_config_backup" ]; then
-        mv "$radio_config_backup" "$radio_config_script"
-    fi
-    
-    if [ $exit_code -eq 0 ]; then
-        echo -e "        ${CHECK} pyMC_Repeater $action completed"
-        return 0
-    else
-        echo -e "        ${CROSS} ${RED}pyMC_Repeater $action failed${NC}"
-        return 1
-    fi
-}
-
-# GitHub repository for UI releases (public distribution repo)
-UI_REPO="dmduran12/pymc_console-dist"
-UI_RELEASE_URL="https://github.com/${UI_REPO}/releases"
-
-# Download and install dashboard from GitHub Releases
-# Installs to separate directory (UI_DIR) instead of overwriting upstream Vue.js
-# Configures web.web_path in config.yaml to point to our dashboard
-# UPGRADE BEHAVIOR: Preserves user's UI preference (stock vs pymc_console)
-install_static_frontend() {
-    local version="${1:-latest}"
-    local target_dir="$UI_DIR"
-    local config_file="$CONFIG_DIR/config.yaml"
-    local temp_file="/tmp/pymc-ui-$$.tar.gz"
-    local download_url
-    
-    # Check current web_path BEFORE making any changes
-    # This preserves user preference for stock vs pymc_console UI
-    local current_web_path=""
-    local is_fresh_install=true
-    if [ -f "$config_file" ] && command -v yq &> /dev/null; then
-        current_web_path=$(yq eval '.web.web_path // ""' "$config_file" 2>/dev/null || echo "")
-        # Trim whitespace and handle "null" string
-        current_web_path=$(echo "$current_web_path" | tr -d '[:space:]')
-        if [ "$current_web_path" = "null" ]; then
-            current_web_path=""
-        fi
-        # If web_path exists (even if empty), this is an upgrade, not fresh install
-        if yq eval '.web | has("web_path")' "$config_file" 2>/dev/null | grep -q 'true'; then
-            is_fresh_install=false
-        fi
-    fi
-    
-    # Construct download URL
-    if [ "$version" = "latest" ]; then
-        download_url="${UI_RELEASE_URL}/latest/download/pymc-ui-latest.tar.gz"
-    else
-        download_url="${UI_RELEASE_URL}/download/${version}/pymc-ui-${version}.tar.gz"
-    fi
-    
-    print_info "Downloading dashboard ($version)..."
-    
-    # Download with curl (preferred - handles redirects better) or wget
-    if command -v curl &> /dev/null; then
-        if ! curl -fsSL -o "$temp_file" "$download_url"; then
-            print_error "Failed to download dashboard from $download_url"
-            rm -f "$temp_file"
-            return 1
-        fi
-    elif command -v wget &> /dev/null; then
-        # wget needs explicit redirect following for GitHub releases
-        if ! wget -q --max-redirect=5 -O "$temp_file" "$download_url"; then
-            print_error "Failed to download dashboard from $download_url"
-            print_info "Check your internet connection or try a specific version"
-            rm -f "$temp_file"
-            return 1
-        fi
-    else
-        print_error "Neither curl nor wget found - cannot download dashboard"
-        return 1
-    fi
-    
-    # Verify download (check file exists and has content)
-    if [ ! -s "$temp_file" ]; then
-        print_error "Downloaded file is empty - release may not exist"
-        print_info "Available releases: ${UI_RELEASE_URL}"
-        rm -f "$temp_file"
-        return 1
-    fi
-    
-    # Remove existing dashboard if present (clean upgrade)
-    if [ -d "$target_dir" ]; then
-        rm -rf "$target_dir"
-    fi
-    
-    # Create parent directories
-    mkdir -p "$(dirname "$target_dir")"
-    mkdir -p "$target_dir"
-    
-    # Extract to target directory
-    if ! tar -xzf "$temp_file" -C "$target_dir" 2>/dev/null; then
-        print_error "Failed to extract dashboard archive"
-        rm -f "$temp_file"
-        return 1
-    fi
-    
-    # Clean up temp file
-    rm -f "$temp_file"
-    
-    # Set permissions
-    chown -R "$SERVICE_USER:$SERVICE_USER" "$CONSOLE_DIR" 2>/dev/null || true
-    
-    # Configure CherryPy web_path based on user preference
-    # - Fresh install: set web_path to our dashboard
-    # - Upgrade with pymc_console selected: keep pointing to our dashboard
-    # - Upgrade with stock UI selected (empty web_path): preserve user's choice
-    if [ -f "$config_file" ] && command -v yq &> /dev/null; then
-        # Ensure web section exists
-        if ! yq eval '.web' "$config_file" 2>/dev/null | grep -q -v "null"; then
-            yq -i '.web = {}' "$config_file" 2>/dev/null || true
-        fi
-        
-        if [ "$is_fresh_install" = true ]; then
-            # Fresh install: default to pymc_console dashboard
-            yq -i ".web.web_path = \"$target_dir\"" "$config_file" 2>/dev/null || {
-                print_warning "Could not set web_path in config - manual configuration may be required"
-            }
-            print_success "Configured web_path: $target_dir"
-        elif [ -n "$current_web_path" ]; then
-            # Upgrade: user was using pymc_console, keep it that way
-            # (Update path in case it moved, though it shouldn't)
-            yq -i ".web.web_path = \"$target_dir\"" "$config_file" 2>/dev/null || true
-            print_success "Preserved UI preference: pymc_console dashboard"
-        else
-            # Upgrade: user was using stock UI (web_path is empty/null)
-            # Preserve their preference - don't change web_path
-            print_success "Preserved UI preference: stock (RightUp) frontend"
-            print_info "Switch to pymc_console via Settings → Web Frontend"
-        fi
-    else
-        print_warning "Could not configure web_path - yq not available or config missing"
-        print_info "Manually set web.web_path in $config_file to: $target_dir"
-    fi
-    
-    local size=$(du -sh "$target_dir" 2>/dev/null | cut -f1 || echo "unknown")
-    print_success "Dashboard installed ($size)"
-    print_info "Upstream Vue.js preserved at: $INSTALL_DIR/repeater/web/html/"
-    print_info "Dashboard will be served at http://<ip>:8000/"
-    
-    return 0
-}
-
-# ============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 # Main Menu
-# ============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
 
-show_main_menu() {
-    local status=$(get_status_display)
-    local core_ver=$(get_core_version)
-    local repeater_ver=$(get_repeater_version)
-    local console_ver=$(get_console_version)
-    local core_branch=$(get_core_branch_from_toml "$CLONE_DIR")
-    local repeater_branch=$(get_repeater_branch)
+show_menu() {
+    local status="Not installed"
+    is_installed && status=$(service_running && echo "Running" || echo "Stopped")
     
-    CHOICE=$($DIALOG --backtitle "pyMC Console Management" --title "pyMC Console" --menu "\n$status\n\nInstalled Versions:\n  Core:     v${core_ver} @${core_branch}\n  Repeater: v${repeater_ver} @${repeater_branch}\n  Console:  ${console_ver}\n\nChoose an action:" 24 70 10 \
-        "install" "Install pyMC Console (fresh install)" \
-        "upgrade" "Upgrade existing installation" \
-        "settings" "Configure radio settings" \
-        "gpio" "GPIO configuration (advanced)" \
-        "start" "Start services" \
-        "stop" "Stop services" \
-        "restart" "Restart services" \
-        "logs" "View live logs" \
-        "uninstall" "Uninstall pyMC Console" \
-        "exit" "Exit" 3>&1 1>&2 2>&3)
+    local choice=$($DIALOG --backtitle "pyMC Console" --title "Main Menu" --menu \
+        "\nStatus: $status\n\nSelect action:" 16 50 6 \
+        "install"   "Fresh installation" \
+        "upgrade"   "Upgrade existing" \
+        "uninstall" "Remove everything" \
+        "status"    "Show versions" \
+        "logs"      "View live logs" \
+        "exit"      "Exit" 3>&1 1>&2 2>&3) || return 1
     
-    case $CHOICE in
-        "install") do_install ;;
-        "upgrade") do_upgrade ;;
-        "settings") do_settings ;;
-        "gpio") do_gpio ;;
-        "start") do_start ;;
-        "stop") do_stop ;;
-        "restart") do_restart ;;
-        "logs")
-            clear
-            echo "=== Live Logs (Press Ctrl+C to return) ==="
-            echo ""
-            journalctl -u "$BACKEND_SERVICE" -f
-            ;;
-        "uninstall") do_uninstall ;;
-        "exit"|"") exit 0 ;;
+    case "$choice" in
+        install)   do_install ;;
+        upgrade)   do_upgrade ;;
+        uninstall) do_uninstall ;;
+        status)    clear; do_status; read -p "Press Enter..." ;;
+        logs)      clear; journalctl -u "$SERVICE_NAME" -f ;;
+        exit)      exit 0 ;;
     esac
 }
 
-# ============================================================================
-# CLI Help
-# ============================================================================
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI Entry Point
+# ─────────────────────────────────────────────────────────────────────────────
 
 show_help() {
-    echo "pyMC Console Management Script"
-    echo ""
-    echo "Usage: $0 [command]"
-    echo ""
-echo "Commands:"
-    echo "  install     Install pyMC Console (fresh install)"
-    echo "  upgrade     Upgrade existing installation"
-    echo "  settings    Configure radio settings"
-    echo "  gpio        GPIO configuration (advanced)"
-    echo "  start       Start pyMC Repeater service"
-    echo "  stop        Stop pyMC Repeater service"
-    echo "  restart     Restart pyMC Repeater service"
-    echo "  uninstall   Completely remove pyMC Console"
-    echo ""
-    echo "Run without arguments for interactive menu."
+    cat << EOF
+pyMC Console - Dashboard Overlay Manager
+
+Usage: $0 [command]
+
+Commands:
+  install [full|console]  Fresh installation (default: interactive)
+                          full    - pyMC_Repeater + Console dashboard
+                          console - Dashboard only (existing Repeater)
+  upgrade                 Upgrade existing installation
+  uninstall               Remove everything
+  start                   Start service
+  stop                    Stop service  
+  restart                 Restart service
+  status                  Show versions and status
+
+Run without arguments for interactive menu.
+
+Radio/GPIO configuration: cd $CLONE_DIR && sudo ./manage.sh
+EOF
 }
 
-# ============================================================================
-# Main Entry Point
-# ============================================================================
-
-# Handle CLI arguments
-case "$1" in
-    "--help"|"-h")
+case "${1:-}" in
+    -h|--help)  show_help ;;
+    install)    setup_dialog; do_install "${2:-}" ;;
+    upgrade)    setup_dialog; do_upgrade ;;
+    uninstall)  setup_dialog; do_uninstall ;;
+    start)      do_start ;;
+    stop)       do_stop ;;
+    restart)    do_restart ;;
+    status)     do_status ;;
+    "")
+        setup_dialog
+        while true; do show_menu || break; done
+        ;;
+    *)
+        echo "Unknown command: $1"
         show_help
-        exit 0
-        ;;
-    "install")
-        check_terminal
-        setup_dialog
-        do_install "$2"
-        exit 0
-        ;;
-    "upgrade")
-        check_terminal
-        setup_dialog
-        do_upgrade
-        exit 0
-        ;;
-    "settings")
-        check_terminal
-        setup_dialog
-        do_settings
-        exit 0
-        ;;
-    "gpio")
-        check_terminal
-        setup_dialog
-        do_gpio
-        exit 0
-        ;;
-    "start")
-        check_terminal
-        setup_dialog
-        do_start
-        exit 0
-        ;;
-    "stop")
-        check_terminal
-        setup_dialog
-        do_stop
-        exit 0
-        ;;
-    "restart")
-        check_terminal
-        setup_dialog
-        do_restart
-        exit 0
-        ;;
-    "uninstall")
-        check_terminal
-        setup_dialog
-        do_uninstall
-        exit 0
+        exit 1
         ;;
 esac
-
-# Interactive menu mode
-check_terminal
-setup_dialog
-
-while true; do
-    show_main_menu
-done
