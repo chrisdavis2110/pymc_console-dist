@@ -107,6 +107,26 @@ get_console_version() {
     echo "unknown"
 }
 
+get_core_version() {
+    pip3 show pymc-core 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "unknown"
+}
+
+get_repeater_version() {
+    pip3 show pymc-repeater 2>/dev/null | grep "^Version:" | awk '{print $2}' || echo "unknown"
+}
+
+print_version_summary() {
+    local core_ver=$(get_core_version)
+    local rep_ver=$(get_repeater_version)
+    local ui_ver=$(get_console_version)
+    
+    echo ""
+    echo -e "  ${DIM}Versions:${NC}"
+    echo -e "    pyMC Core:     ${CYAN}$core_ver${NC}"
+    echo -e "    pyMC Repeater: ${CYAN}$rep_ver${NC}"
+    echo -e "    pyMC Console:  ${CYAN}v$ui_ver${NC}"
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Git Operations
 # ─────────────────────────────────────────────────────────────────────────────
@@ -268,6 +288,7 @@ do_install() {
     local ip=$(hostname -I 2>/dev/null | awk '{print $1}')
     echo ""
     echo -e "${GREEN}${BOLD}Installation Complete!${NC}"
+    print_version_summary
     echo ""
     echo -e "  Dashboard: ${CYAN}http://$ip:8000/${NC}"
     echo ""
@@ -337,6 +358,7 @@ do_upgrade() {
     local ip=$(hostname -I 2>/dev/null | awk '{print $1}')
     echo ""
     echo -e "${GREEN}${BOLD}Upgrade Complete!${NC}"
+    print_version_summary
     echo ""
     echo -e "  Dashboard: ${CYAN}http://$ip:8000/${NC}"
     echo ""
@@ -366,7 +388,12 @@ do_uninstall() {
     # Step 1: Run upstream uninstall (if available)
     print_step 1 2 "Removing pyMC_Repeater"
     if [[ -f "$CLONE_DIR/manage.sh" ]]; then
-        run_upstream "uninstall" || true
+        # Run upstream uninstaller in subshell to isolate exit behavior
+        # (upstream may have its own set -e or exit calls)
+        (
+            set +e  # Disable errexit in subshell
+            cd "$CLONE_DIR" && bash manage.sh uninstall
+        ) || true
     else
         # Manual cleanup if upstream not available
         systemctl stop "$SERVICE_NAME" 2>/dev/null || true
