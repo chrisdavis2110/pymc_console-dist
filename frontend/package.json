@@ -1,6 +1,6 @@
 {
   "name": "pymc_console",
-  "version": "0.9.212",
+  "version": "0.9.213",
   "description": "Vite + React Dashboard for pyMC_Repeater",
   "private": true,
   "type": "module",
@@ -11,7 +11,8 @@
     "build:static": "npm run build && npm run package",
     "package": "rm -rf dist && mkdir -p dist && cp -r out/* dist/",
     "preview": "vite preview",
-    "lint": "eslint"
+    "lint": "eslint",
+    "generate:geo-channels": "node scripts/generate-geo-channels.cjs"
   },
   "dependencies": {
     "@cosmograph/react": "^2.0.1",
@@ -61,6 +62,8 @@
     "@types/react": "^18",
     "@types/react-dom": "^18",
     "@vitejs/plugin-react-swc": "^3.7.2",
+    "cities.json": "^1.1.50",
+    "country-state-city": "^3.2.1",
     "eslint": "^9",
     "eslint-plugin-react-hooks": "^7.0.1",
     "eslint-plugin-react-refresh": "^0.4.25",
