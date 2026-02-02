@@ -1,0 +1,1 @@
+const s={snappy:{type:"spring",stiffness:500,damping:30},smooth:{type:"spring",stiffness:300,damping:30},gentle:{type:"spring",stiffness:200,damping:25}},n={fast:.15,medium:.3},e={easeIn:[.4,0,1,1]},a={normal:.05};export{s as a,n as d,e,a as s};
