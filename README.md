@@ -114,7 +114,7 @@ Six color schemes and a built-in terminal for direct repeater interaction.
 - **Live packet metrics** — Received, forwarded, dropped packets with sparkline charts
 - **TX Delay Recommendations** — Slot-based delay optimization with network role classification (edge/relay/hub/backbone)
 - **LBT Insights widgets** — Channel health, collision risk, noise floor, link quality at a glance
-- **Time range selector** — View stats from 20 minutes to 7 days
+- **Time range selector** — View stats from 20 minutes to 14 days
 - **Recent packets** — Live feed of incoming traffic with centralized polling (every 3s)
 
 ### Contacts & Topology
@@ -187,56 +187,63 @@ Once complete, access your dashboard at `http://<your-pi-ip>:8000`
 After installation, run `sudo bash manage.sh` to access the management menu:
 
 ```
-┌─────────────────────────────────────┐
-│     pyMC Console Management         │
-├─────────────────────────────────────┤
-│  1. Start Service                   │
-│  2. Stop Service                    │
-│  3. Restart Service                 │
-│  4. View Logs                       │
-│  5. Configure Radio                 │
-│  6. Configure GPIO                  │
-│  7. Upgrade                         │
-│  8. Uninstall                       │
-│  9. Exit                            │
-└─────────────────────────────────────┘
+┌────────────────────────────────────────────────┐
+│  pyMC Console                                  │
+│  Status: Running                               │
+├────────────────────────────────────────────────┤
+│  install    Fresh installation                 │
+│  upgrade    Upgrade existing                   │
+│  uninstall  Remove everything                  │
+│  status     Show versions                      │
+│  logs       View live logs                     │
+│  exit       Exit                               │
+└────────────────────────────────────────────────┘
 ```
 
 ### Menu Options
 
-- **Start/Stop/Restart** — Control the repeater service
-- **View Logs** — Live log output from the repeater
-- **Configure Radio** — Set frequency, power, bandwidth, SF via preset selection
-- **Configure GPIO** — Set up SPI bus and GPIO pins for your LoRa module
-- **Upgrade** — Pull latest updates and reinstall
-- **Uninstall** — Remove the installation completely
+- **Install** — Fresh installation (Full Stack or Console-only)
+- **Upgrade** — Update Console dashboard and/or full pyMC stack
+- **Uninstall** — Remove Console, Repeater, and cloned repos
+- **Status** — Show installed versions (Core, Repeater, Console)
+- **Logs** — Live log output from the repeater
+
+### Radio/GPIO Configuration
+
+Radio and GPIO settings are managed by upstream pyMC_Repeater:
+
+```bash
+cd ~/pyMC_Repeater && sudo ./manage.sh
+```
 
 ## Upgrading
 
-To update to the latest version, use the TUI menu:
+To update to the latest version:
 
 ```bash
 cd pymc_console
-sudo bash manage.sh
+sudo bash manage.sh upgrade
 ```
 
-Select **Upgrade** and choose:
-- **Console UI only** — Updates just the web dashboard (recommended, quick)
-- **Full upgrade** — Updates Console + pulls latest pyMC_Repeater/pyMC_core
+Or use the interactive menu and select **Upgrade**, then choose:
+- **Console only** — Updates just the web dashboard (quick, safe)
+- **Full Stack** — Updates Console + pulls latest pyMC_Repeater/pyMC_core
 
 **Note:** You can safely upgrade Console without affecting your Repeater installation. This is useful when you want new dashboard features but your repeater is running stable.
+
+The script auto-updates itself before upgrading, so you always get the latest installer.
 
 ## Configuration
 
 ### Radio Settings
 
-Use the **Configure Radio** menu option, or edit directly:
+Radio configuration is handled by upstream pyMC_Repeater. Use their management script:
 
 ```bash
-sudo nano /etc/pymc_repeater/config.yaml
+cd ~/pyMC_Repeater && sudo ./manage.sh
 ```
 
-Key settings:
+Or edit the config directly:
 ```yaml
 radio:
   frequency: 927875000      # Frequency in Hz
@@ -392,7 +399,7 @@ Before Viterbi decoding, candidates are scored using four-factor analysis inspir
 - **Dual-hop anchoring** — Candidates scored by distance to both previous and next hops (a relay must be within RF range of both neighbors)
 - **Score-weighted redistribution** — Appearance counts redistributed proportionally by combined score
 
-The system maintains up to 75,000 packets in session memory (~2.5 days at 30k/day) for comprehensive topology evidence.
+The system maintains up to 500,000 packets in session memory for comprehensive topology evidence, with tiered loading (24h initial → 3d → 7d → 14d on demand).
 
 ### Edge Rendering
 
